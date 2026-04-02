@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-PocketFM Internal Tools — Streamlit Web App
+Internal Tools — Streamlit Web App
 Two tools in one:
   1. DocX Combiner & Formatter  — sorts, merges, and formats chapter headings
   2. Benchmark Converter        — converts docx files to benchmark format
@@ -28,8 +28,8 @@ from lxml import etree
 # ══════════════════════════════════════════════════════════════════════
 
 st.set_page_config(
-    page_title="PocketFM Tools",
-    page_icon="🎙️",
+    page_title="Tools",
+    page_icon="🛠️",
     layout="centered",
 )
 
@@ -39,22 +39,13 @@ st.set_page_config(
 # ══════════════════════════════════════════════════════════════════════
 
 with st.sidebar:
-    st.image(
-        "https://upload.wikimedia.org/wikipedia/commons/thumb/4/47/PNG_transparency_demonstration_1.png/280px-PNG_transparency_demonstration_1.png",
-        width=60,
-    ) if False else None   # placeholder; replace with your logo URL if desired
-
-    st.title("🎙️ PocketFM Tools")
-    st.markdown("Select the tool you want to use:")
+    st.markdown("### Select Tool")
 
     selected_tool = st.radio(
         label="Tool",
         options=["📚 DocX Combiner", "⚙️ Benchmark Converter"],
         label_visibility="collapsed",
     )
-
-    st.divider()
-    st.caption("Internal tools — PocketFM")
 
 
 # ══════════════════════════════════════════════════════════════════════
