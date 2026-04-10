@@ -4,20 +4,21 @@ Internal Tools — Streamlit Web App
 Three tools in one:
   1. DocX Combiner & Formatter  — sorts, merges, and formats chapter headings
   2. Benchmark Converter        — converts docx files to benchmark format
-  3. Document Translator        — translates .docx files via Google Translate (free)
+  3. Document Translator        — translates .docx via Gemini AI (upload or Drive link)
 """
 
 import io
+import os
 import re
 import shutil
 import tempfile
 import threading
+import time
 import traceback
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-import requests
 import streamlit as st
 from docx import Document
 from docx.shared import Inches
@@ -25,6 +26,18 @@ from docx.enum.style import WD_STYLE_TYPE
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 from lxml import etree
+
+try:
+    import google.generativeai as genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+
+try:
+    import gdown
+    GDOWN_AVAILABLE = True
+except ImportError:
+    GDOWN_AVAILABLE = False
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -44,7 +57,6 @@ st.set_page_config(
 
 with st.sidebar:
     st.markdown("### Select Tool")
-
     selected_tool = st.radio(
         label="Tool",
         options=["📚 DocX Combiner", "⚙️ Benchmark Converter", "🌐 Document Translator"],
@@ -364,21 +376,14 @@ def render_docx_combiner():
 # ══════════════════════════════════════════════════════════════════════
 
 def extract_show_info_from_filename(filename: str):
-    """
-    Extract show name and episode range from filename.
-    Expected format: <show_name>_<first>-<last>.docx
-    """
     name = re.sub(r'\.docx$', '', filename, flags=re.IGNORECASE)
-    name = re.sub(r'\s*\(\d+\)$', '', name)  # strip browser duplicate suffixes
-
+    name = re.sub(r'\s*\(\d+\)$', '', name)
     match = re.search(r'^(.+?)_(\d+)-(\d+)$', name)
     if match:
         return match.group(1), int(match.group(2)), int(match.group(3))
-
     alt = re.search(r'^(.+?)_(\d+)-(\d+)', name)
     if alt:
         return alt.group(1), int(alt.group(2)), int(alt.group(3))
-
     return name, 1, 500
 
 
@@ -400,23 +405,15 @@ def set_document_background_pagination(doc):
 
 
 def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
-    """
-    Convert one uploaded .docx to benchmark format.
-    Returns (output_bytes, output_filename).
-    """
     show_name, first_ep, last_ep = extract_show_info_from_filename(filename)
-
     doc = Document(io.BytesIO(file_bytes))
     new_doc = Document()
-
     set_document_background_pagination(new_doc)
-
     for section in new_doc.sections:
         section.top_margin    = Inches(1)
         section.bottom_margin = Inches(1)
         section.left_margin   = Inches(1)
         section.right_margin  = Inches(1)
-
     styles = new_doc.styles
     try:
         styles['Heading 1']
@@ -433,31 +430,26 @@ def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[
         re.compile(r'^Chapter\s+(\d+):', re.IGNORECASE),
     ]
     title_pattern = re.compile(r':\s*(.+)$')
-
-    current_episode = first_ep
+    current_episode  = first_ep
     paragraphs_to_add = []
 
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
             continue
-
-        is_heading   = False
-        episode_num  = None
-
+        is_heading  = False
+        episode_num = None
         for pattern in episode_patterns:
             m = pattern.match(text)
             if m:
                 episode_num = int(m.group(1))
                 is_heading  = True
                 break
-
         if not is_heading and para.style.name.startswith('Heading'):
             is_heading = True
             num_m = re.search(r'\d+', text)
             if num_m:
                 episode_num = int(num_m.group())
-
         if is_heading:
             heading_text = f"Episode {episode_num}" if episode_num else f"Episode {current_episode}"
             current_episode = (episode_num or current_episode) + 1
@@ -489,7 +481,7 @@ def render_benchmark_converter():
     st.markdown(
         "Upload one or more `.docx` files — **one per show** — and this tool will "
         "convert each file into the **benchmark format** accepted by PocketFM's "
-        "internal review tool. Each show's file is processed and downloaded separately."
+        "internal review tool."
     )
     st.markdown(
         "**Expected filename format:** `ShowName_FirstEp-LastEp.docx`  \n"
@@ -501,10 +493,7 @@ def render_benchmark_converter():
         "Upload .docx files (one per show)",
         type=["docx"],
         accept_multiple_files=True,
-        help=(
-            "You can upload files for multiple shows at once. "
-            "Each file will be converted independently and you'll get one output file per show."
-        ),
+        key="bench_uploader",
     )
     st.divider()
 
@@ -513,7 +502,6 @@ def render_benchmark_converter():
         return
 
     st.subheader(f"📂 {len(uploaded_files)} file(s) ready to convert")
-
     with st.expander("🔍 Files detected", expanded=True):
         for uf in uploaded_files:
             show_name, first_ep, last_ep = extract_show_info_from_filename(uf.name)
@@ -527,8 +515,8 @@ def render_benchmark_converter():
         return
 
     progress_bar = st.progress(0, text="Starting conversion...")
-    errors       = []
-    results      = []   # list of (output_bytes, output_filename)
+    errors  = []
+    results = []
 
     for i, uf in enumerate(uploaded_files):
         progress_bar.progress(
@@ -543,7 +531,6 @@ def render_benchmark_converter():
 
     progress_bar.progress(100, text="Done!")
 
-    # ── Show errors if any ──
     if errors:
         for fname, err_msg, tb in errors:
             st.error(f"❌ Failed to convert **{fname}**: {err_msg}")
@@ -556,7 +543,6 @@ def render_benchmark_converter():
     st.success(f"✅ Successfully converted **{len(results)}** file(s)!")
     st.markdown("---")
 
-    # ── Individual download buttons ──
     if len(results) == 1:
         out_bytes, out_name = results[0]
         st.download_button(
@@ -577,8 +563,6 @@ def render_benchmark_converter():
                 mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
                 use_container_width=True,
             )
-
-        # ── Also offer a single ZIP with all files ──
         st.markdown("**Or download everything at once:**")
         zip_buf = io.BytesIO()
         with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -601,15 +585,32 @@ def render_benchmark_converter():
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  TOOL 3 — DOCUMENT TRANSLATOR
+#  TOOL 3 — DOCUMENT TRANSLATOR  (Free Google Translate  OR  Gemini AI)
 # ══════════════════════════════════════════════════════════════════════
 
-TRANSLATE_URL     = "https://translate.googleapis.com/translate_a/single"
-TRANS_BATCH_SIZE  = 20    # paragraphs per API call
-TRANS_BATCH_WORKERS = 10  # concurrent batch calls per file
-TRANS_FILE_WORKERS  = 3   # parallel files
+GEMINI_BATCH_SIZE    = 30    # paragraphs per Gemini call
+GTRANS_BATCH_SIZE    = 20    # paragraphs per free-API call
+GTRANS_BATCH_WORKERS = 10    # concurrent free-API batches per file
+TRANS_FILE_WORKERS   = 3     # parallel files (both engines)
+
+GTRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
 LANGUAGES = {
+    "Chinese (Simplified)": "Chinese (Simplified)",
+    "Chinese (Traditional)": "Chinese (Traditional)",
+    "Korean": "Korean",
+    "Japanese": "Japanese",
+    "Arabic": "Arabic",
+    "Spanish": "Spanish",
+    "French": "French",
+    "German": "German",
+    "Hindi": "Hindi",
+    "Portuguese": "Portuguese",
+    "Russian": "Russian",
+    "English": "English",
+}
+
+GTRANS_LANG_CODES = {
     "Chinese (Simplified)": "zh-CN",
     "Chinese (Traditional)": "zh-TW",
     "Korean": "ko",
@@ -624,11 +625,21 @@ LANGUAGES = {
     "English": "en",
 }
 
+GEMINI_MODELS = [
+    "gemini-1.5-flash",
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",
+]
 
-def _trans_api_call(text: str, src: str, tgt: str) -> str:
-    r = requests.get(
-        TRANSLATE_URL,
-        params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
+
+# ── Free Google Translate engine ─────────────────────────────────────────────
+
+def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
+    """Single call to the free Google Translate endpoint."""
+    import requests as _req
+    r = _req.get(
+        GTRANSLATE_URL,
+        params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
         timeout=20,
     )
     r.raise_for_status()
@@ -636,59 +647,48 @@ def _trans_api_call(text: str, src: str, tgt: str) -> str:
     return "".join(part[0] for part in data[0] if part[0])
 
 
-def _trans_single(text: str, src: str, tgt: str) -> str:
-    if not text.strip():
-        return text
-    try:
-        return _trans_api_call(text, src, tgt)
-    except Exception:
-        return text
-
-
-def _trans_batch(texts: list, src: str, tgt: str) -> list:
-    """Translate a list of paragraphs in one call joined by \\n.
-    Falls back to individual calls if line counts don't match."""
+def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
+    """Translate a batch via free API using \\n separator; falls back individually."""
     if not texts:
         return texts
     try:
-        result = _trans_api_call("\n".join(texts), src, tgt)
+        result = _gtrans_call("\n".join(texts), src_code, tgt_code)
         parts  = result.split("\n")
         if len(parts) == len(texts):
             return [p.strip() for p in parts]
     except Exception:
         pass
-    # Fallback: translate individually
-    return [_trans_single(t, src, tgt) for t in texts]
+    return [_gtrans_call(t, src_code, tgt_code) if t.strip() else t for t in texts]
 
 
-def translate_docx_bytes(file_bytes: bytes, src_lang: str, tgt_lang: str,
-                         progress_cb=None) -> bytes:
-    """Translate all paragraphs in a .docx using parallel batches."""
+def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
+                            progress_cb=None) -> bytes:
+    """Translate a .docx using the free Google Translate API (parallel batches)."""
+    src_code = GTRANS_LANG_CODES.get(src, "auto")
+    tgt_code = GTRANS_LANG_CODES.get(tgt, "en")
+
     src_doc   = Document(io.BytesIO(file_bytes))
     all_texts = [p.text for p in src_doc.paragraphs]
+    non_empty = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
+    texts     = [t for _, t in non_empty]
+    idx_map   = [i for i, _ in non_empty]
 
-    non_empty     = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
-    texts         = [t for _, t in non_empty]
-    idx_map       = [i for i, _ in non_empty]
     translated_map = {}
     completed      = [0]
     lock           = threading.Lock()
 
-    batches = [
-        (start, texts[start:start + TRANS_BATCH_SIZE])
-        for start in range(0, len(texts), TRANS_BATCH_SIZE)
-    ]
+    batches = [(s, texts[s:s + GTRANS_BATCH_SIZE]) for s in range(0, len(texts), GTRANS_BATCH_SIZE)]
 
     def run_batch(start, batch_texts):
-        results = _trans_batch(batch_texts, src_lang, tgt_lang)
+        res = _gtrans_batch(batch_texts, src_code, tgt_code)
         with lock:
-            for j, trans_text in enumerate(results):
-                translated_map[idx_map[start + j]] = trans_text
+            for j, trans in enumerate(res):
+                translated_map[idx_map[start + j]] = trans
             completed[0] += 1
             if progress_cb:
                 progress_cb(completed[0], len(batches))
 
-    with ThreadPoolExecutor(max_workers=TRANS_BATCH_WORKERS) as ex:
+    with ThreadPoolExecutor(max_workers=GTRANS_BATCH_WORKERS) as ex:
         futs = [ex.submit(run_batch, s, b) for s, b in batches]
         for f in as_completed(futs):
             f.result()
@@ -708,129 +708,351 @@ def translate_docx_bytes(file_bytes: bytes, src_lang: str, tgt_lang: str,
     return buf.getvalue()
 
 
+# ── Gemini engine ─────────────────────────────────────────────────────────────
+
+def _gemini_translate_batch(texts: list, src: str, tgt: str, model) -> list:
+    """Send a numbered list to Gemini, get back numbered translations."""
+    if not texts:
+        return texts
+
+    numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
+    prompt = (
+        f"Translate each numbered item from {src} to {tgt}.\n"
+        f"Return ONLY the numbered translations in the exact same format (1. 2. 3. ...).\n"
+        f"Do not add explanations, notes, or extra lines.\n\n"
+        f"{numbered}"
+    )
+
+    for attempt in range(3):
+        try:
+            response  = model.generate_content(prompt)
+            raw       = response.text.strip()
+            parsed    = []
+            for line in raw.splitlines():
+                m = re.match(r'^\d+\.\s*(.*)', line.strip())
+                if m:
+                    parsed.append(m.group(1).strip())
+            if len(parsed) == len(texts):
+                return parsed
+            # fallback: plain non-empty lines
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            if len(lines) == len(texts):
+                return lines
+        except Exception:
+            if attempt < 2:
+                time.sleep(3)
+
+    return texts   # return originals if all retries fail
+
+
+def _translate_docx_gemini(file_bytes: bytes, src: str, tgt: str,
+                            model, progress_cb=None) -> bytes:
+    """Translate all paragraphs in a .docx using Gemini and return new bytes."""
+    src_doc   = Document(io.BytesIO(file_bytes))
+    all_texts = [p.text for p in src_doc.paragraphs]
+
+    non_empty     = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
+    texts         = [t for _, t in non_empty]
+    idx_map       = [i for i, _ in non_empty]
+    translated_map = {}
+
+    batches     = [texts[s:s + GEMINI_BATCH_SIZE] for s in range(0, len(texts), GEMINI_BATCH_SIZE)]
+    total       = len(batches)
+
+    for b_idx, batch in enumerate(batches):
+        translated = _gemini_translate_batch(batch, src, tgt, model)
+        start      = b_idx * GEMINI_BATCH_SIZE
+        for j, trans_text in enumerate(translated):
+            translated_map[idx_map[start + j]] = trans_text
+        if progress_cb:
+            progress_cb(b_idx + 1, total)
+        time.sleep(0.25)
+
+    dst_doc = Document()
+    for i, para in enumerate(src_doc.paragraphs):
+        text     = translated_map.get(i, para.text)
+        new_para = dst_doc.add_paragraph(text)
+        try:
+            if para.style and para.style.name:
+                new_para.style = dst_doc.styles[para.style.name]
+        except Exception:
+            pass
+
+    buf = io.BytesIO()
+    dst_doc.save(buf)
+    return buf.getvalue()
+
+
+def _fetch_files_from_drive(folder_url: str) -> dict:
+    """
+    Download all .docx files from a public Google Drive folder.
+    Returns {filename: bytes}.
+    Folder must be shared as 'Anyone with the link can view'.
+    """
+    if not GDOWN_AVAILABLE:
+        raise RuntimeError("gdown is not installed. Cannot fetch from Drive.")
+
+    tmp_dir = tempfile.mkdtemp()
+    try:
+        gdown.download_folder(
+            url=folder_url,
+            output=tmp_dir,
+            quiet=True,
+            use_cookies=False,
+        )
+        result = {}
+        for root, _, filenames in os.walk(tmp_dir):
+            for fn in filenames:
+                if fn.lower().endswith(".docx"):
+                    with open(os.path.join(root, fn), "rb") as f:
+                        result[fn] = f.read()
+        return result
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def render_document_translator():
     st.title("🌐 Document Translator")
     st.markdown(
-        "Upload any number of `.docx` files and translate them all at once. "
-        "Uses Google Translate — **free, no API key needed**. "
-        "Files are processed in parallel with batch API calls for maximum speed."
+        "Translate `.docx` files — upload from your computer or paste a Google Drive folder link. "
+        "All files process in parallel and download as a single ZIP."
     )
     st.divider()
 
-    # Session-state keys namespaced so they don't clash with other tools
-    if "tr_results" not in st.session_state:
-        st.session_state.tr_results = {}
-    if "tr_errors" not in st.session_state:
-        st.session_state.tr_errors  = {}
+    # ── Session state init ────────────────────────────────────────────────────
+    for key, default in [("tr_results", {}), ("tr_errors", {}), ("tr_api_key", "")]:
+        if key not in st.session_state:
+            st.session_state[key] = default
 
-    col1, col2, col3 = st.columns([2, 1, 2])
+    # ── ① Engine selector ────────────────────────────────────────────────────
+    engine = st.radio(
+        "Translation engine",
+        options=["🆓  Free — Google Translate (no key needed)",
+                 "✨  Gemini AI — higher quality (API key required)"],
+        key="tr_engine",
+        horizontal=True,
+    )
+    use_gemini = engine.startswith("✨")
+
+    # ── ② Gemini API key box (only when Gemini is selected) ──────────────────
+    model_name = GEMINI_MODELS[0]
+
+    if use_gemini:
+        if not GEMINI_AVAILABLE:
+            st.error("⛔ `google-generativeai` package missing. Add it to requirements.txt and redeploy.")
+            return
+
+        st.markdown(
+            """
+            <div style="
+                background: linear-gradient(135deg, #667eea22, #764ba222);
+                border: 2px solid #667eea;
+                border-radius: 12px;
+                padding: 18px 20px 10px 20px;
+                margin: 12px 0 4px 0;
+            ">
+            <p style="margin:0 0 6px 0; font-weight:700; font-size:1rem;">
+                🔑 &nbsp;Gemini API Key <span style="color:#667eea">(required)</span>
+            </p>
+            """,
+            unsafe_allow_html=True,
+        )
+        api_key_input = st.text_input(
+            label="gemini_key_label",
+            label_visibility="collapsed",
+            type="password",
+            placeholder="AIzaSy…  — paste your key here",
+            value=st.session_state.tr_api_key,
+            key="tr_api_key_input",
+        )
+        st.markdown(
+            """
+            <p style="margin:4px 0 0 0; font-size:0.8rem; color:#888;">
+            Get a free key at
+            <a href="https://aistudio.google.com/apikey" target="_blank">aistudio.google.com/apikey</a>
+            &nbsp;·&nbsp; gemini-1.5-flash is free up to 1,500 requests/day
+            </p></div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if api_key_input:
+            st.session_state.tr_api_key = api_key_input
+
+        st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+        model_name = st.selectbox("Gemini model", GEMINI_MODELS, index=0, key="tr_model")
+    else:
+        st.caption("Uses Google Translate's free public endpoint — no account or key needed.")
+
+    st.divider()
+
+    # ── ③ Language selectors ──────────────────────────────────────────────────
+    col1, col2, col3 = st.columns([2, 0.6, 2])
     with col1:
-        src_name = st.selectbox("Source language", list(LANGUAGES.keys()), index=0,
-                                key="tr_src")
+        src_name = st.selectbox("Source language", list(LANGUAGES.keys()),
+                                index=0, key="tr_src")
     with col2:
-        st.markdown("<br><div style='text-align:center;font-size:24px'>→</div>",
+        st.markdown("<br><div style='text-align:center;font-size:22px'>→</div>",
                     unsafe_allow_html=True)
     with col3:
-        tgt_name = st.selectbox("Target language", list(LANGUAGES.keys()), index=11,
-                                key="tr_tgt")
+        tgt_name = st.selectbox("Target language", list(LANGUAGES.keys()),
+                                index=11, key="tr_tgt")
 
     src_lang = LANGUAGES[src_name]
     tgt_lang = LANGUAGES[tgt_name]
 
     st.divider()
 
-    uploaded_files = st.file_uploader(
-        "Upload one or more .docx files",
-        type=["docx"],
-        accept_multiple_files=True,
-        help="All files are translated in parallel. Large files finish in seconds.",
-        key="tr_uploader",
-    )
+    # ── ④ Input — two tabs ────────────────────────────────────────────────────
+    tab_upload, tab_drive = st.tabs(["📁  Upload Files from Computer",
+                                     "🔗  Google Drive Folder Link"])
 
-    if uploaded_files:
-        st.info(
-            f"**{len(uploaded_files)} file(s)** ready · "
-            f"batches of {TRANS_BATCH_SIZE} paragraphs · "
-            f"{TRANS_BATCH_WORKERS} concurrent batches per file"
+    with tab_upload:
+        uploaded_files = st.file_uploader(
+            "Select one or more .docx files",
+            type=["docx"],
+            accept_multiple_files=True,
+            key="tr_uploader",
+            help="Hold Cmd/Ctrl to select multiple files at once",
         )
 
-        if st.button("🚀 Translate All", type="primary", use_container_width=True,
-                     key="tr_go"):
+    with tab_drive:
+        st.markdown("")
+        drive_link = st.text_input(
+            "Paste Google Drive folder link",
+            placeholder="https://drive.google.com/drive/folders/…",
+            key="tr_drive_link",
+        )
+        st.caption(
+            "⚠️ Folder must be shared as **'Anyone with the link can view'** — "
+            "private folders require the Colab notebook instead."
+        )
 
-            st.session_state.tr_results = {}
-            st.session_state.tr_errors  = {}
+    st.divider()
 
-            file_bytes = {f.name: f.read() for f in uploaded_files}
+    # ── ⑤ Readiness check & translate button ─────────────────────────────────
+    has_input = bool(uploaded_files) or bool(drive_link)
+    has_key   = bool(st.session_state.tr_api_key) if use_gemini else True
+    ready     = has_input and has_key
 
-            progress_state = {
-                name: {"done": 0, "total": 1, "status": "queued"}
-                for name in file_bytes
-            }
-            results    = {}
-            errors     = {}
-            outer_lock = threading.Lock()
+    if use_gemini and not has_key:
+        st.warning("⬆️ Enter your Gemini API key above to enable translation.")
+    elif not has_input:
+        st.info("⬆️ Upload files or paste a Drive folder link to get started.")
 
-            ui = {}
-            for name in file_bytes:
-                st.markdown(f"**{name}**")
-                ui[name] = {"bar": st.progress(0), "status": st.empty()}
-                ui[name]["status"].text("⌛ Queued…")
-            st.divider()
+    if st.button("🚀  Translate All & Download ZIP", type="primary",
+                 use_container_width=True, disabled=not ready, key="tr_go"):
 
-            def file_worker(name, content):
-                progress_state[name]["status"] = "running"
+        st.session_state.tr_results = {}
+        st.session_state.tr_errors  = {}
 
-                def on_batch(done, total):
-                    progress_state[name].update(done=done, total=total)
+        # Set up Gemini model if needed
+        gemini_model = None
+        if use_gemini:
+            genai.configure(api_key=st.session_state.tr_api_key)
+            gemini_model = genai.GenerativeModel(model_name)
 
+        # Collect file bytes from upload and/or Drive
+        file_bytes = {}
+        if uploaded_files:
+            for f in uploaded_files:
+                file_bytes[f.name] = f.read()
+
+        if drive_link:
+            with st.spinner("📥 Fetching files from Google Drive…"):
                 try:
-                    translated = translate_docx_bytes(
+                    drive_files = _fetch_files_from_drive(drive_link)
+                    if not drive_files:
+                        st.error("No .docx files found in that Drive folder.")
+                    else:
+                        file_bytes.update(drive_files)
+                        st.success(f"✅ Downloaded {len(drive_files)} file(s) from Drive.")
+                except Exception as e:
+                    st.error(f"❌ Could not fetch from Drive: {e}")
+
+        if not file_bytes:
+            st.stop()
+
+        engine_label = f"Gemini · {model_name}" if use_gemini else "Google Translate (free)"
+        st.info(f"Translating **{len(file_bytes)} file(s)** — "
+                f"{src_lang} → {tgt_lang} · {engine_label}")
+
+        # Shared state — workers write only plain dicts, never st.*
+        progress_state = {
+            name: {"done": 0, "total": 1, "status": "queued"}
+            for name in file_bytes
+        }
+        results    = {}
+        errors     = {}
+        outer_lock = threading.Lock()
+
+        # Build per-file UI rows in main thread
+        ui = {}
+        for name in file_bytes:
+            st.markdown(f"**{name}**")
+            ui[name] = {"bar": st.progress(0), "status": st.empty()}
+            ui[name]["status"].text("⌛ Queued…")
+        st.divider()
+
+        # Worker — pure computation, zero st.* calls inside
+        def file_worker(name, content):
+            progress_state[name]["status"] = "running"
+
+            def on_batch(done, total):
+                progress_state[name].update(done=done, total=total)
+
+            try:
+                if use_gemini:
+                    translated = _translate_docx_gemini(
+                        content, src_lang, tgt_lang, gemini_model, progress_cb=on_batch
+                    )
+                else:
+                    translated = _translate_docx_gtrans(
                         content, src_lang, tgt_lang, progress_cb=on_batch
                     )
-                    with outer_lock:
-                        results[name] = translated
-                    progress_state[name]["status"] = "done"
-                except Exception as e:
-                    with outer_lock:
-                        errors[name] = str(e)
-                    progress_state[name]["status"] = "error"
+                with outer_lock:
+                    results[name] = translated
+                progress_state[name]["status"] = "done"
+            except Exception as e:
+                with outer_lock:
+                    errors[name] = str(e)
+                progress_state[name]["status"] = "error"
 
-            with ThreadPoolExecutor(max_workers=TRANS_FILE_WORKERS) as executor:
-                futures = {
-                    executor.submit(file_worker, n, c): n
-                    for n, c in file_bytes.items()
-                }
-                while not all(f.done() for f in futures):
-                    for name, state in progress_state.items():
-                        pct = state["done"] / max(state["total"], 1)
-                        s   = state["status"]
-                        if s == "queued":
-                            ui[name]["status"].text("⌛ Queued…")
-                        elif s == "running":
-                            ui[name]["bar"].progress(pct)
-                            ui[name]["status"].text(
-                                f"⏳ batch {state['done']}/{state['total']} ({int(pct*100)}%)"
-                            )
-                        elif s == "done":
-                            ui[name]["bar"].progress(1.0)
-                            ui[name]["status"].text("✅ Done!")
-                        elif s == "error":
-                            ui[name]["status"].text(
-                                f"❌ {errors.get(name, 'unknown error')}"
-                            )
-                    time.sleep(0.3)
+        # Run workers + poll UI from main thread
+        with ThreadPoolExecutor(max_workers=TRANS_FILE_WORKERS) as executor:
+            futures = {
+                executor.submit(file_worker, n, c): n
+                for n, c in file_bytes.items()
+            }
+            while not all(f.done() for f in futures):
+                for name, state in progress_state.items():
+                    pct = state["done"] / max(state["total"], 1)
+                    s   = state["status"]
+                    if s == "queued":
+                        ui[name]["status"].text("⌛ Queued…")
+                    elif s == "running":
+                        ui[name]["bar"].progress(pct)
+                        ui[name]["status"].text(
+                            f"⏳ batch {state['done']}/{state['total']} ({int(pct*100)}%)"
+                        )
+                    elif s == "done":
+                        ui[name]["bar"].progress(1.0)
+                        ui[name]["status"].text("✅ Done!")
+                    elif s == "error":
+                        ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
+                time.sleep(0.3)
 
-            for name, state in progress_state.items():
-                if state["status"] == "done":
-                    ui[name]["bar"].progress(1.0)
-                    ui[name]["status"].text("✅ Done!")
-                elif state["status"] == "error":
-                    ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
+        # Final pass to catch any last-second state updates
+        for name, state in progress_state.items():
+            if state["status"] == "done":
+                ui[name]["bar"].progress(1.0)
+                ui[name]["status"].text("✅ Done!")
+            elif state["status"] == "error":
+                ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
 
-            st.session_state.tr_results = results
-            st.session_state.tr_errors  = errors
+        st.session_state.tr_results = results
+        st.session_state.tr_errors  = errors
 
-    # ── Download section persists across re-runs via session_state ──────────
+    # ── ⑥ Download — persists across re-runs via session_state ───────────────
     if st.session_state.get("tr_results"):
         results = st.session_state.tr_results
         errors  = st.session_state.tr_errors
@@ -870,21 +1092,16 @@ def render_document_translator():
         if errors:
             st.warning(f"⚠️ {len(errors)} file(s) failed: {', '.join(errors.keys())}")
 
-    elif not uploaded_files:
-        st.info("👆 Upload your `.docx` files above to get started.")
-
     st.divider()
     st.caption(
-        "Paragraphs are translated in batches of 20 with 10 concurrent API calls per file · "
-        "Uses Google Translate's free endpoint — no account needed"
+        "🆓 Free mode: Google Translate public endpoint, 20 paragraphs/batch, 10 parallel batches · "
+        "✨ Gemini mode: numbered-list batches of 30 paragraphs, higher accuracy"
     )
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  ROUTER
 # ══════════════════════════════════════════════════════════════════════
-
-import time  # needed by translator polling loop
 
 if selected_tool == "📚 DocX Combiner":
     render_docx_combiner()
