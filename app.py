@@ -1,19 +1,23 @@
 # -*- coding: utf-8 -*-
 """
 Internal Tools — Streamlit Web App
-Two tools in one:
+Three tools in one:
   1. DocX Combiner & Formatter  — sorts, merges, and formats chapter headings
   2. Benchmark Converter        — converts docx files to benchmark format
+  3. Document Translator        — translates .docx files via Google Translate (free)
 """
 
 import io
 import re
 import shutil
 import tempfile
+import threading
 import traceback
 import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+import requests
 import streamlit as st
 from docx import Document
 from docx.shared import Inches
@@ -43,7 +47,7 @@ with st.sidebar:
 
     selected_tool = st.radio(
         label="Tool",
-        options=["📚 DocX Combiner", "⚙️ Benchmark Converter"],
+        options=["📚 DocX Combiner", "⚙️ Benchmark Converter", "🌐 Document Translator"],
         label_visibility="collapsed",
     )
 
@@ -597,10 +601,294 @@ def render_benchmark_converter():
 
 
 # ══════════════════════════════════════════════════════════════════════
+#  TOOL 3 — DOCUMENT TRANSLATOR
+# ══════════════════════════════════════════════════════════════════════
+
+TRANSLATE_URL     = "https://translate.googleapis.com/translate_a/single"
+TRANS_BATCH_SIZE  = 20    # paragraphs per API call
+TRANS_BATCH_WORKERS = 10  # concurrent batch calls per file
+TRANS_FILE_WORKERS  = 3   # parallel files
+
+LANGUAGES = {
+    "Chinese (Simplified)": "zh-CN",
+    "Chinese (Traditional)": "zh-TW",
+    "Korean": "ko",
+    "Japanese": "ja",
+    "Arabic": "ar",
+    "Spanish": "es",
+    "French": "fr",
+    "German": "de",
+    "Hindi": "hi",
+    "Portuguese": "pt",
+    "Russian": "ru",
+    "English": "en",
+}
+
+
+def _trans_api_call(text: str, src: str, tgt: str) -> str:
+    r = requests.get(
+        TRANSLATE_URL,
+        params={"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text},
+        timeout=20,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return "".join(part[0] for part in data[0] if part[0])
+
+
+def _trans_single(text: str, src: str, tgt: str) -> str:
+    if not text.strip():
+        return text
+    try:
+        return _trans_api_call(text, src, tgt)
+    except Exception:
+        return text
+
+
+def _trans_batch(texts: list, src: str, tgt: str) -> list:
+    """Translate a list of paragraphs in one call joined by \\n.
+    Falls back to individual calls if line counts don't match."""
+    if not texts:
+        return texts
+    try:
+        result = _trans_api_call("\n".join(texts), src, tgt)
+        parts  = result.split("\n")
+        if len(parts) == len(texts):
+            return [p.strip() for p in parts]
+    except Exception:
+        pass
+    # Fallback: translate individually
+    return [_trans_single(t, src, tgt) for t in texts]
+
+
+def translate_docx_bytes(file_bytes: bytes, src_lang: str, tgt_lang: str,
+                         progress_cb=None) -> bytes:
+    """Translate all paragraphs in a .docx using parallel batches."""
+    src_doc   = Document(io.BytesIO(file_bytes))
+    all_texts = [p.text for p in src_doc.paragraphs]
+
+    non_empty     = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
+    texts         = [t for _, t in non_empty]
+    idx_map       = [i for i, _ in non_empty]
+    translated_map = {}
+    completed      = [0]
+    lock           = threading.Lock()
+
+    batches = [
+        (start, texts[start:start + TRANS_BATCH_SIZE])
+        for start in range(0, len(texts), TRANS_BATCH_SIZE)
+    ]
+
+    def run_batch(start, batch_texts):
+        results = _trans_batch(batch_texts, src_lang, tgt_lang)
+        with lock:
+            for j, trans_text in enumerate(results):
+                translated_map[idx_map[start + j]] = trans_text
+            completed[0] += 1
+            if progress_cb:
+                progress_cb(completed[0], len(batches))
+
+    with ThreadPoolExecutor(max_workers=TRANS_BATCH_WORKERS) as ex:
+        futs = [ex.submit(run_batch, s, b) for s, b in batches]
+        for f in as_completed(futs):
+            f.result()
+
+    dst_doc = Document()
+    for i, para in enumerate(src_doc.paragraphs):
+        text     = translated_map.get(i, para.text)
+        new_para = dst_doc.add_paragraph(text)
+        try:
+            if para.style and para.style.name:
+                new_para.style = dst_doc.styles[para.style.name]
+        except Exception:
+            pass
+
+    buf = io.BytesIO()
+    dst_doc.save(buf)
+    return buf.getvalue()
+
+
+def render_document_translator():
+    st.title("🌐 Document Translator")
+    st.markdown(
+        "Upload any number of `.docx` files and translate them all at once. "
+        "Uses Google Translate — **free, no API key needed**. "
+        "Files are processed in parallel with batch API calls for maximum speed."
+    )
+    st.divider()
+
+    # Session-state keys namespaced so they don't clash with other tools
+    if "tr_results" not in st.session_state:
+        st.session_state.tr_results = {}
+    if "tr_errors" not in st.session_state:
+        st.session_state.tr_errors  = {}
+
+    col1, col2, col3 = st.columns([2, 1, 2])
+    with col1:
+        src_name = st.selectbox("Source language", list(LANGUAGES.keys()), index=0,
+                                key="tr_src")
+    with col2:
+        st.markdown("<br><div style='text-align:center;font-size:24px'>→</div>",
+                    unsafe_allow_html=True)
+    with col3:
+        tgt_name = st.selectbox("Target language", list(LANGUAGES.keys()), index=11,
+                                key="tr_tgt")
+
+    src_lang = LANGUAGES[src_name]
+    tgt_lang = LANGUAGES[tgt_name]
+
+    st.divider()
+
+    uploaded_files = st.file_uploader(
+        "Upload one or more .docx files",
+        type=["docx"],
+        accept_multiple_files=True,
+        help="All files are translated in parallel. Large files finish in seconds.",
+        key="tr_uploader",
+    )
+
+    if uploaded_files:
+        st.info(
+            f"**{len(uploaded_files)} file(s)** ready · "
+            f"batches of {TRANS_BATCH_SIZE} paragraphs · "
+            f"{TRANS_BATCH_WORKERS} concurrent batches per file"
+        )
+
+        if st.button("🚀 Translate All", type="primary", use_container_width=True,
+                     key="tr_go"):
+
+            st.session_state.tr_results = {}
+            st.session_state.tr_errors  = {}
+
+            file_bytes = {f.name: f.read() for f in uploaded_files}
+
+            progress_state = {
+                name: {"done": 0, "total": 1, "status": "queued"}
+                for name in file_bytes
+            }
+            results    = {}
+            errors     = {}
+            outer_lock = threading.Lock()
+
+            ui = {}
+            for name in file_bytes:
+                st.markdown(f"**{name}**")
+                ui[name] = {"bar": st.progress(0), "status": st.empty()}
+                ui[name]["status"].text("⌛ Queued…")
+            st.divider()
+
+            def file_worker(name, content):
+                progress_state[name]["status"] = "running"
+
+                def on_batch(done, total):
+                    progress_state[name].update(done=done, total=total)
+
+                try:
+                    translated = translate_docx_bytes(
+                        content, src_lang, tgt_lang, progress_cb=on_batch
+                    )
+                    with outer_lock:
+                        results[name] = translated
+                    progress_state[name]["status"] = "done"
+                except Exception as e:
+                    with outer_lock:
+                        errors[name] = str(e)
+                    progress_state[name]["status"] = "error"
+
+            with ThreadPoolExecutor(max_workers=TRANS_FILE_WORKERS) as executor:
+                futures = {
+                    executor.submit(file_worker, n, c): n
+                    for n, c in file_bytes.items()
+                }
+                while not all(f.done() for f in futures):
+                    for name, state in progress_state.items():
+                        pct = state["done"] / max(state["total"], 1)
+                        s   = state["status"]
+                        if s == "queued":
+                            ui[name]["status"].text("⌛ Queued…")
+                        elif s == "running":
+                            ui[name]["bar"].progress(pct)
+                            ui[name]["status"].text(
+                                f"⏳ batch {state['done']}/{state['total']} ({int(pct*100)}%)"
+                            )
+                        elif s == "done":
+                            ui[name]["bar"].progress(1.0)
+                            ui[name]["status"].text("✅ Done!")
+                        elif s == "error":
+                            ui[name]["status"].text(
+                                f"❌ {errors.get(name, 'unknown error')}"
+                            )
+                    time.sleep(0.3)
+
+            for name, state in progress_state.items():
+                if state["status"] == "done":
+                    ui[name]["bar"].progress(1.0)
+                    ui[name]["status"].text("✅ Done!")
+                elif state["status"] == "error":
+                    ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
+
+            st.session_state.tr_results = results
+            st.session_state.tr_errors  = errors
+
+    # ── Download section persists across re-runs via session_state ──────────
+    if st.session_state.get("tr_results"):
+        results = st.session_state.tr_results
+        errors  = st.session_state.tr_errors
+
+        st.subheader("⬇️ Download Translated Files")
+
+        zip_buf = io.BytesIO()
+        with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for name, data in results.items():
+                zf.writestr(name.replace(".docx", "_EN.docx"), data)
+        zip_buf.seek(0)
+
+        st.download_button(
+            label=f"📦  Download ALL {len(results)} file(s) as ZIP",
+            data=zip_buf.getvalue(),
+            file_name="translated_docs.zip",
+            mime="application/zip",
+            type="primary",
+            use_container_width=True,
+            key="tr_zip",
+        )
+
+        if len(results) > 1:
+            st.caption("Or download individual files:")
+            cols = st.columns(min(len(results), 3))
+            for i, (name, data) in enumerate(results.items()):
+                out_name = name.replace(".docx", "_EN.docx")
+                with cols[i % len(cols)]:
+                    st.download_button(
+                        label=f"⬇️ {out_name}",
+                        data=data,
+                        file_name=out_name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        key=f"tr_dl_{name}",
+                    )
+
+        if errors:
+            st.warning(f"⚠️ {len(errors)} file(s) failed: {', '.join(errors.keys())}")
+
+    elif not uploaded_files:
+        st.info("👆 Upload your `.docx` files above to get started.")
+
+    st.divider()
+    st.caption(
+        "Paragraphs are translated in batches of 20 with 10 concurrent API calls per file · "
+        "Uses Google Translate's free endpoint — no account needed"
+    )
+
+
+# ══════════════════════════════════════════════════════════════════════
 #  ROUTER
 # ══════════════════════════════════════════════════════════════════════
 
+import time  # needed by translator polling loop
+
 if selected_tool == "📚 DocX Combiner":
     render_docx_combiner()
-else:
+elif selected_tool == "⚙️ Benchmark Converter":
     render_benchmark_converter()
+else:
+    render_document_translator()
