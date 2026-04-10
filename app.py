@@ -588,10 +588,11 @@ def render_benchmark_converter():
 #  TOOL 3 — DOCUMENT TRANSLATOR  (Free Google Translate  OR  Gemini AI)
 # ══════════════════════════════════════════════════════════════════════
 
-GEMINI_BATCH_SIZE    = 30    # paragraphs per Gemini call
-GTRANS_BATCH_SIZE    = 20    # paragraphs per free-API call
-GTRANS_BATCH_WORKERS = 10    # concurrent free-API batches per file
-TRANS_FILE_WORKERS   = 3     # parallel files (both engines)
+GEMINI_BATCH_SIZE      = 50   # paragraphs per Gemini call (larger = fewer API calls)
+GEMINI_MAX_CONCURRENT  = 12   # max simultaneous Gemini API calls across ALL files
+TRANS_FILE_WORKERS     = 5    # parallel files (both engines)
+GTRANS_BATCH_SIZE      = 20   # paragraphs per free-API call
+GTRANS_BATCH_WORKERS   = 10   # concurrent free-API batches per file
 
 GTRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
@@ -746,27 +747,43 @@ def _gemini_translate_batch(texts: list, src: str, tgt: str, model) -> list:
 
 
 def _translate_docx_gemini(file_bytes: bytes, src: str, tgt: str,
-                            model, progress_cb=None) -> bytes:
-    """Translate all paragraphs in a .docx using Gemini and return new bytes."""
+                            model, progress_cb=None,
+                            semaphore: threading.Semaphore = None) -> bytes:
+    """
+    Translate all paragraphs in a .docx using Gemini.
+    Batches run in parallel, gated by a shared semaphore to respect rate limits.
+    """
     src_doc   = Document(io.BytesIO(file_bytes))
     all_texts = [p.text for p in src_doc.paragraphs]
 
-    non_empty     = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
-    texts         = [t for _, t in non_empty]
-    idx_map       = [i for i, _ in non_empty]
+    non_empty      = [(i, t) for i, t in enumerate(all_texts) if t.strip()]
+    texts          = [t for _, t in non_empty]
+    idx_map        = [i for i, _ in non_empty]
     translated_map = {}
+    completed      = [0]
+    map_lock       = threading.Lock()
 
-    batches     = [texts[s:s + GEMINI_BATCH_SIZE] for s in range(0, len(texts), GEMINI_BATCH_SIZE)]
-    total       = len(batches)
+    batches = [(s, texts[s:s + GEMINI_BATCH_SIZE])
+               for s in range(0, len(texts), GEMINI_BATCH_SIZE)]
+    total   = len(batches)
 
-    for b_idx, batch in enumerate(batches):
-        translated = _gemini_translate_batch(batch, src, tgt, model)
-        start      = b_idx * GEMINI_BATCH_SIZE
-        for j, trans_text in enumerate(translated):
-            translated_map[idx_map[start + j]] = trans_text
-        if progress_cb:
-            progress_cb(b_idx + 1, total)
-        time.sleep(0.25)
+    def run_batch(start, batch):
+        # Acquire semaphore to cap global concurrent Gemini calls
+        ctx = semaphore if semaphore else threading.Semaphore(GEMINI_MAX_CONCURRENT)
+        with ctx:
+            result = _gemini_translate_batch(batch, src, tgt, model)
+        with map_lock:
+            for j, trans_text in enumerate(result):
+                translated_map[idx_map[start + j]] = trans_text
+            completed[0] += 1
+            if progress_cb:
+                progress_cb(completed[0], total)
+
+    # All batches for this file fire in parallel (rate-limited by semaphore)
+    with ThreadPoolExecutor(max_workers=GEMINI_MAX_CONCURRENT) as ex:
+        futs = [ex.submit(run_batch, s, b) for s, b in batches]
+        for f in as_completed(futs):
+            f.result()   # re-raise any unexpected errors
 
     dst_doc = Document()
     for i, para in enumerate(src_doc.paragraphs):
@@ -945,11 +962,13 @@ def render_document_translator():
         st.session_state.tr_results = {}
         st.session_state.tr_errors  = {}
 
-        # Set up Gemini model if needed
-        gemini_model = None
+        # Set up Gemini model + shared rate-limit semaphore
+        gemini_model     = None
+        gemini_semaphore = None
         if use_gemini:
             genai.configure(api_key=st.session_state.tr_api_key)
-            gemini_model = genai.GenerativeModel(model_name)
+            gemini_model     = genai.GenerativeModel(model_name)
+            gemini_semaphore = threading.Semaphore(GEMINI_MAX_CONCURRENT)
 
         # Collect file bytes from upload and/or Drive
         file_bytes = {}
@@ -1003,7 +1022,8 @@ def render_document_translator():
             try:
                 if use_gemini:
                     translated = _translate_docx_gemini(
-                        content, src_lang, tgt_lang, gemini_model, progress_cb=on_batch
+                        content, src_lang, tgt_lang, gemini_model,
+                        progress_cb=on_batch, semaphore=gemini_semaphore
                     )
                 else:
                     translated = _translate_docx_gtrans(
