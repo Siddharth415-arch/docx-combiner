@@ -592,7 +592,7 @@ GEMINI_BATCH_SIZE      = 25   # paragraphs per Gemini call (sweet spot for relia
 GEMINI_MAX_CONCURRENT  = 12   # max simultaneous Gemini API calls across ALL files
 TRANS_FILE_WORKERS     = 5    # parallel files (both engines)
 GTRANS_BATCH_SIZE      = 20   # paragraphs per free-API call
-GTRANS_BATCH_WORKERS   = 10   # concurrent free-API batches per file
+GTRANS_BATCH_WORKERS   = 4    # concurrent free-API batches per file (keep low to avoid throttling)
 
 GTRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
@@ -1096,9 +1096,12 @@ def render_document_translator():
                         ui[name]["status"].text("⌛ Queued…")
                     elif s == "running":
                         ui[name]["bar"].progress(pct)
-                        ui[name]["status"].text(
-                            f"⏳ batch {state['done']}/{state['total']} ({int(pct*100)}%)"
-                        )
+                        if pct >= 1.0:
+                            ui[name]["status"].text("📝 Finalizing document…")
+                        else:
+                            ui[name]["status"].text(
+                                f"⏳ {state['done']}/{state['total']} batches ({int(pct*100)}%)"
+                            )
                     elif s == "done":
                         ui[name]["bar"].progress(1.0)
                         ui[name]["status"].text("✅ Done!")
@@ -1106,7 +1109,7 @@ def render_document_translator():
                         ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
                 time.sleep(0.3)
 
-        # Final pass to catch any last-second state updates
+        # Final pass
         for name, state in progress_state.items():
             if state["status"] == "done":
                 ui[name]["bar"].progress(1.0)
@@ -1116,6 +1119,9 @@ def render_document_translator():
 
         st.session_state.tr_results = results
         st.session_state.tr_errors  = errors
+
+        # Force a clean re-render so the download section appears immediately
+        st.rerun()
 
     # ── ⑥ Download — persists across re-runs via session_state ───────────────
     if st.session_state.get("tr_results"):
