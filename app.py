@@ -588,7 +588,7 @@ def render_benchmark_converter():
 #  TOOL 3 — DOCUMENT TRANSLATOR  (Free Google Translate  OR  Gemini AI)
 # ══════════════════════════════════════════════════════════════════════
 
-GEMINI_BATCH_SIZE      = 50   # paragraphs per Gemini call (larger = fewer API calls)
+GEMINI_BATCH_SIZE      = 25   # paragraphs per Gemini call (sweet spot for reliable parsing)
 GEMINI_MAX_CONCURRENT  = 12   # max simultaneous Gemini API calls across ALL files
 TRANS_FILE_WORKERS     = 5    # parallel files (both engines)
 GTRANS_BATCH_SIZE      = 20   # paragraphs per free-API call
@@ -649,17 +649,29 @@ def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
 
 
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
-    """Translate a batch via free API using \\n separator; falls back individually."""
+    """
+    Translate a batch via free Google Translate API.
+    RAISES on failure — never silently returns original text.
+    """
     if not texts:
         return texts
     try:
         result = _gtrans_call("\n".join(texts), src_code, tgt_code)
-        parts  = result.split("\n")
+        parts  = [p.strip() for p in result.split("\n")]
         if len(parts) == len(texts):
-            return [p.strip() for p in parts]
-    except Exception:
-        pass
-    return [_gtrans_call(t, src_code, tgt_code) if t.strip() else t for t in texts]
+            return parts
+    except Exception as e:
+        raise RuntimeError(
+            f"Google Translate API call failed: {e}\n"
+            "If this keeps happening, the free endpoint may be blocked from this server — "
+            "try switching to Gemini mode instead."
+        )
+
+    # Fallback: try one-by-one
+    results = []
+    for t in texts:
+        results.append(_gtrans_call(t, src_code, tgt_code) if t.strip() else t)
+    return results
 
 
 def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
@@ -712,38 +724,55 @@ def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
 # ── Gemini engine ─────────────────────────────────────────────────────────────
 
 def _gemini_translate_batch(texts: list, src: str, tgt: str, model) -> list:
-    """Send a numbered list to Gemini, get back numbered translations."""
+    """
+    Send a numbered list to Gemini, get back numbered translations.
+    RAISES RuntimeError on failure — never silently returns original text.
+    """
     if not texts:
         return texts
 
     numbered = "\n".join(f"{i+1}. {t}" for i, t in enumerate(texts))
     prompt = (
-        f"Translate each numbered item from {src} to {tgt}.\n"
-        f"Return ONLY the numbered translations in the exact same format (1. 2. 3. ...).\n"
-        f"Do not add explanations, notes, or extra lines.\n\n"
+        f"You are a professional translator. Translate every numbered item below from {src} to {tgt}.\n"
+        f"RULES:\n"
+        f"- Output ONLY the translated lines, numbered identically (1. 2. 3. …)\n"
+        f"- Never skip, merge, or add items — the count must stay exactly {len(texts)}\n"
+        f"- Do not add any explanation, header, or extra text\n\n"
         f"{numbered}"
     )
 
+    last_error = "Unknown error"
     for attempt in range(3):
         try:
-            response  = model.generate_content(prompt)
-            raw       = response.text.strip()
-            parsed    = []
+            response = model.generate_content(prompt)
+            raw      = response.text.strip()
+
+            # Primary parse: "N. text" lines
+            parsed = []
             for line in raw.splitlines():
-                m = re.match(r'^\d+\.\s*(.*)', line.strip())
+                m = re.match(r'^\d+\.\s*(.+)', line.strip())
                 if m:
                     parsed.append(m.group(1).strip())
+
             if len(parsed) == len(texts):
                 return parsed
-            # fallback: plain non-empty lines
-            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+
+            # Fallback: non-empty, non-numeric-only lines
+            lines = [l.strip() for l in raw.splitlines()
+                     if l.strip() and not re.match(r'^\d+\.?\s*$', l.strip())]
             if len(lines) == len(texts):
                 return lines
-        except Exception:
-            if attempt < 2:
-                time.sleep(3)
 
-    return texts   # return originals if all retries fail
+            last_error = (
+                f"Gemini returned {len(parsed)} items, expected {len(texts)}. "
+                f"Raw preview: {raw[:300]}"
+            )
+        except Exception as e:
+            last_error = str(e)
+            if attempt < 2:
+                time.sleep(2)
+
+    raise RuntimeError(f"Gemini translation failed after 3 attempts: {last_error}")
 
 
 def _translate_docx_gemini(file_bytes: bytes, src: str, tgt: str,
@@ -955,6 +984,22 @@ def render_document_translator():
         st.warning("⬆️ Enter your Gemini API key above to enable translation.")
     elif not has_input:
         st.info("⬆️ Upload files or paste a Drive folder link to get started.")
+
+    # ── Quick API key test ────────────────────────────────────────────────────
+    if use_gemini and has_key:
+        if st.button("🔬 Test API Key", key="tr_test"):
+            with st.spinner("Testing Gemini API key…"):
+                try:
+                    genai.configure(api_key=st.session_state.tr_api_key)
+                    test_model    = genai.GenerativeModel(model_name)
+                    test_response = test_model.generate_content(
+                        f"Translate this from Chinese (Simplified) to English. "
+                        f"Reply with ONLY the translation, nothing else: 你好，世界"
+                    )
+                    result_text = test_response.text.strip()
+                    st.success(f"✅ API key works! Test translation: **{result_text}**")
+                except Exception as e:
+                    st.error(f"❌ API key test failed: {e}")
 
     if st.button("🚀  Translate All & Download ZIP", type="primary",
                  use_container_width=True, disabled=not ready, key="tr_go"):
