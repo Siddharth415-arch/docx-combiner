@@ -636,45 +636,64 @@ GEMINI_MODELS = [
 
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
     """
-    Translate a batch via deep-translator's GoogleTranslator (works server-side).
-    Single joined call for speed; falls back to per-text if counts mismatch.
-    RAISES on failure — never silently returns original text.
+    Translate a batch — server-safe, with retry + fallback.
+    1. GoogleTranslator (deep-translator) — single joined call, up to 3 retries
+    2. MyMemory (separate service)        — per-text, fires only if Google fails all retries
+    RAISES only if both services fail.
     """
     if not texts:
         return texts
-    try:
+
+    non_empty_idx   = [i for i, t in enumerate(texts) if t.strip()]
+    non_empty_texts = [texts[i] for i in non_empty_idx]
+
+    if not non_empty_texts:
+        return texts
+
+    def _try_google(text_list: list) -> list:
         from deep_translator import GoogleTranslator
-        translator = GoogleTranslator(source=src_code, target=tgt_code)
-
-        non_empty_idx   = [i for i, t in enumerate(texts) if t.strip()]
-        non_empty_texts = [texts[i] for i in non_empty_idx]
-
-        if not non_empty_texts:
-            return texts
-
-        # ── Fast path: single API call with \n separator ──────────────
-        joined = "\n".join(non_empty_texts)
-        if len(joined) <= 4500:          # stay under Google's ~5 000-char limit
-            result_str = translator.translate(joined)
+        tr = GoogleTranslator(source=src_code, target=tgt_code)
+        joined = "\n".join(text_list)
+        if len(joined) <= 4500:
+            result_str = tr.translate(joined)
             parts = [p.strip() for p in result_str.split("\n")]
-            if len(parts) == len(non_empty_texts):
-                out = list(texts)
-                for i, idx in enumerate(non_empty_idx):
-                    out[idx] = parts[i] if parts[i] else texts[idx]
-                return out
+            if len(parts) == len(text_list):
+                return parts
+        # per-text within Google if joined is too long or counts mismatch
+        return [tr.translate(t[:4500]) or t for t in text_list]
 
-        # ── Fallback: one call per text (handles long paragraphs) ─────
+    # ── Primary: Google with 3 retries ───────────────────────────────
+    last_google_err = None
+    for attempt in range(3):
+        try:
+            translated = _try_google(non_empty_texts)
+            out = list(texts)
+            for i, idx in enumerate(non_empty_idx):
+                out[idx] = translated[i] if translated[i] else texts[idx]
+            return out
+        except Exception as e:
+            last_google_err = e
+            if attempt < 2:
+                time.sleep(2)
+
+    # ── Fallback: MyMemory (different service, different servers) ─────
+    try:
+        from deep_translator import MyMemoryTranslator
+        # MyMemory expects "zh-CN" style source, "en-US" style target
+        mm_tgt = "en-US" if tgt_code == "en" else tgt_code
+        tr_mm  = MyMemoryTranslator(source=src_code, target=mm_tgt)
         out = list(texts)
         for idx in non_empty_idx:
-            t = texts[idx]
-            out[idx] = translator.translate(t[:4500]) if t.strip() else t
+            chunk = texts[idx][:480]   # MyMemory 500-char limit per call
+            out[idx] = tr_mm.translate(chunk) or texts[idx]
         return out
-
-    except Exception as e:
+    except Exception as e2:
         raise RuntimeError(
-            f"Google Translate failed: {e}\n"
-            "If this keeps happening, try switching to Gemini mode instead."
-        ) from e
+            f"Translation failed on all attempts.\n"
+            f"Google error: {last_google_err}\n"
+            f"MyMemory error: {e2}\n"
+            "Try switching to Gemini mode instead."
+        ) from last_google_err
 
 
 def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
