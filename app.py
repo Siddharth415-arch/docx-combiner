@@ -671,7 +671,7 @@ def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
     """
     Translate a batch via Google Translate with browser-like headers + retries.
-    Fast path: single joined call. Falls back to per-text on count mismatch.
+    Fast path: single joined call. Falls back to parallel per-text on mismatch.
     RAISES only after all retries fail.
     """
     if not texts:
@@ -685,7 +685,7 @@ def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
 
     last_err = None
 
-    # ── Attempt joined batch (fast) with retries ─────────────────────
+    # ── Fast path: single joined call with retries ────────────────────
     joined = "\n".join(non_empty_texts)
     if len(joined) <= 4500:
         for attempt in range(3):
@@ -697,28 +697,32 @@ def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
                     for i, idx in enumerate(non_empty_idx):
                         out[idx] = parts[i] if parts[i] else texts[idx]
                     return out
-                break   # count mismatch — skip to per-text fallback
+                break   # count mismatch — fall through to parallel per-text
             except Exception as e:
                 last_err = e
                 if attempt < 2:
-                    time.sleep(1)
+                    time.sleep(0.5)
 
-    # ── Per-text fallback (long paragraphs or count mismatch) ────────
-    out = list(texts)
-    for idx in non_empty_idx:
+    # ── Parallel per-text fallback (count mismatch or long paragraphs) ─
+    def _translate_one(idx):
         for attempt in range(3):
             try:
-                out[idx] = _gtrans_call(texts[idx][:4500], src_code, tgt_code)
-                break
+                return idx, _gtrans_call(texts[idx][:4500], src_code, tgt_code)
             except Exception as e:
-                last_err = e
                 if attempt < 2:
-                    time.sleep(1)
-        else:
-            raise RuntimeError(
-                f"Google Translate failed after retries: {last_err}\n"
-                "Try switching to Gemini mode instead."
-            ) from last_err
+                    time.sleep(0.5)
+                else:
+                    raise RuntimeError(
+                        f"Google Translate failed after retries: {e}\n"
+                        "Try switching to Gemini mode instead."
+                    ) from e
+
+    out = list(texts)
+    with ThreadPoolExecutor(max_workers=GTRANS_BATCH_WORKERS) as ex:
+        futs = {ex.submit(_translate_one, idx): idx for idx in non_empty_idx}
+        for f in as_completed(futs):
+            idx, translated = f.result()
+            out[idx] = translated if translated else texts[idx]
     return out
 
 
