@@ -634,32 +634,14 @@ GEMINI_MODELS = [
 
 # ── Free Google Translate engine ─────────────────────────────────────────────
 
-_GTRANS_SESSION = None
-
-def _get_gtrans_session():
-    """Reusable requests.Session with browser-like headers to avoid blocks."""
-    global _GTRANS_SESSION
-    if _GTRANS_SESSION is None:
-        import requests as _req
-        s = _req.Session()
-        s.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/122.0.0.0 Safari/537.36"
-            ),
-            "Referer": "https://translate.google.com/",
-            "Accept-Language": "en-US,en;q=0.9",
-        })
-        _GTRANS_SESSION = s
-    return _GTRANS_SESSION
+GTRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
 
 def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
-    """Single translation call with browser-like session."""
-    s = _get_gtrans_session()
-    r = s.get(
-        "https://translate.googleapis.com/translate_a/single",
+    """Single call to the free Google Translate endpoint."""
+    import requests as _req
+    r = _req.get(
+        GTRANSLATE_URL,
         params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
         timeout=20,
     )
@@ -670,60 +652,28 @@ def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
 
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
     """
-    Translate a batch via Google Translate with browser-like headers + retries.
-    Fast path: single joined call. Falls back to parallel per-text on mismatch.
-    RAISES only after all retries fail.
+    Translate a batch via free Google Translate API.
+    RAISES on failure — never silently returns original text.
     """
     if not texts:
         return texts
+    try:
+        result = _gtrans_call("\n".join(texts), src_code, tgt_code)
+        parts  = [p.strip() for p in result.split("\n")]
+        if len(parts) == len(texts):
+            return parts
+    except Exception as e:
+        raise RuntimeError(
+            f"Google Translate API call failed: {e}\n"
+            "If this keeps happening, the free endpoint may be blocked from this server — "
+            "try switching to Gemini mode instead."
+        )
 
-    non_empty_idx   = [i for i, t in enumerate(texts) if t.strip()]
-    non_empty_texts = [texts[i] for i in non_empty_idx]
-
-    if not non_empty_texts:
-        return texts
-
-    last_err = None
-
-    # ── Fast path: single joined call with retries ────────────────────
-    joined = "\n".join(non_empty_texts)
-    if len(joined) <= 4500:
-        for attempt in range(3):
-            try:
-                result = _gtrans_call(joined, src_code, tgt_code)
-                parts  = [p.strip() for p in result.split("\n")]
-                if len(parts) == len(non_empty_texts):
-                    out = list(texts)
-                    for i, idx in enumerate(non_empty_idx):
-                        out[idx] = parts[i] if parts[i] else texts[idx]
-                    return out
-                break   # count mismatch — fall through to parallel per-text
-            except Exception as e:
-                last_err = e
-                if attempt < 2:
-                    time.sleep(0.5)
-
-    # ── Parallel per-text fallback (count mismatch or long paragraphs) ─
-    def _translate_one(idx):
-        for attempt in range(3):
-            try:
-                return idx, _gtrans_call(texts[idx][:4500], src_code, tgt_code)
-            except Exception as e:
-                if attempt < 2:
-                    time.sleep(0.5)
-                else:
-                    raise RuntimeError(
-                        f"Google Translate failed after retries: {e}\n"
-                        "Try switching to Gemini mode instead."
-                    ) from e
-
-    out = list(texts)
-    with ThreadPoolExecutor(max_workers=GTRANS_BATCH_WORKERS) as ex:
-        futs = {ex.submit(_translate_one, idx): idx for idx in non_empty_idx}
-        for f in as_completed(futs):
-            idx, translated = f.result()
-            out[idx] = translated if translated else texts[idx]
-    return out
+    # Fallback: try one-by-one
+    results = []
+    for t in texts:
+        results.append(_gtrans_call(t, src_code, tgt_code) if t.strip() else t)
+    return results
 
 
 def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
