@@ -637,6 +637,7 @@ GEMINI_MODELS = [
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
     """
     Translate a batch via deep-translator's GoogleTranslator (works server-side).
+    Single joined call for speed; falls back to per-text if counts mismatch.
     RAISES on failure — never silently returns original text.
     """
     if not texts:
@@ -645,19 +646,29 @@ def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
         from deep_translator import GoogleTranslator
         translator = GoogleTranslator(source=src_code, target=tgt_code)
 
-        # Separate empty strings (preserve them) from non-empty
         non_empty_idx   = [i for i, t in enumerate(texts) if t.strip()]
         non_empty_texts = [texts[i] for i in non_empty_idx]
 
         if not non_empty_texts:
             return texts
 
-        translated = translator.translate_batch(non_empty_texts)
+        # ── Fast path: single API call with \n separator ──────────────
+        joined = "\n".join(non_empty_texts)
+        if len(joined) <= 4500:          # stay under Google's ~5 000-char limit
+            result_str = translator.translate(joined)
+            parts = [p.strip() for p in result_str.split("\n")]
+            if len(parts) == len(non_empty_texts):
+                out = list(texts)
+                for i, idx in enumerate(non_empty_idx):
+                    out[idx] = parts[i] if parts[i] else texts[idx]
+                return out
 
-        result = list(texts)
-        for i, idx in enumerate(non_empty_idx):
-            result[idx] = translated[i] if translated[i] else texts[idx]
-        return result
+        # ── Fallback: one call per text (handles long paragraphs) ─────
+        out = list(texts)
+        for idx in non_empty_idx:
+            t = texts[idx]
+            out[idx] = translator.translate(t[:4500]) if t.strip() else t
+        return out
 
     except Exception as e:
         raise RuntimeError(
