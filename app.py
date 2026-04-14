@@ -594,7 +594,6 @@ TRANS_FILE_WORKERS     = 5    # parallel files (both engines)
 GTRANS_BATCH_SIZE      = 20   # paragraphs per free-API call
 GTRANS_BATCH_WORKERS   = 4    # concurrent free-API batches per file (keep low to avoid throttling)
 
-GTRANSLATE_URL = "https://translate.googleapis.com/translate_a/single"
 
 LANGUAGES = {
     "Chinese (Simplified)": "Chinese (Simplified)",
@@ -633,45 +632,38 @@ GEMINI_MODELS = [
 ]
 
 
-# ── Free Google Translate engine ─────────────────────────────────────────────
-
-def _gtrans_call(text: str, src_code: str, tgt_code: str) -> str:
-    """Single call to the free Google Translate endpoint."""
-    import requests as _req
-    r = _req.get(
-        GTRANSLATE_URL,
-        params={"client": "gtx", "sl": src_code, "tl": tgt_code, "dt": "t", "q": text},
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
-    return "".join(part[0] for part in data[0] if part[0])
-
+# ── Free Google Translate engine (via deep-translator, server-safe) ──────────
 
 def _gtrans_batch(texts: list, src_code: str, tgt_code: str) -> list:
     """
-    Translate a batch via free Google Translate API.
+    Translate a batch via deep-translator's GoogleTranslator (works server-side).
     RAISES on failure — never silently returns original text.
     """
     if not texts:
         return texts
     try:
-        result = _gtrans_call("\n".join(texts), src_code, tgt_code)
-        parts  = [p.strip() for p in result.split("\n")]
-        if len(parts) == len(texts):
-            return parts
+        from deep_translator import GoogleTranslator
+        translator = GoogleTranslator(source=src_code, target=tgt_code)
+
+        # Separate empty strings (preserve them) from non-empty
+        non_empty_idx   = [i for i, t in enumerate(texts) if t.strip()]
+        non_empty_texts = [texts[i] for i in non_empty_idx]
+
+        if not non_empty_texts:
+            return texts
+
+        translated = translator.translate_batch(non_empty_texts)
+
+        result = list(texts)
+        for i, idx in enumerate(non_empty_idx):
+            result[idx] = translated[i] if translated[i] else texts[idx]
+        return result
+
     except Exception as e:
         raise RuntimeError(
-            f"Google Translate API call failed: {e}\n"
-            "If this keeps happening, the free endpoint may be blocked from this server — "
-            "try switching to Gemini mode instead."
-        )
-
-    # Fallback: try one-by-one
-    results = []
-    for t in texts:
-        results.append(_gtrans_call(t, src_code, tgt_code) if t.strip() else t)
-    return results
+            f"Google Translate failed: {e}\n"
+            "If this keeps happening, try switching to Gemini mode instead."
+        ) from e
 
 
 def _translate_docx_gtrans(file_bytes: bytes, src: str, tgt: str,
