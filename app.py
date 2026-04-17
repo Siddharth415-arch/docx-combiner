@@ -115,13 +115,16 @@ CHAPTER_PATTERNS = [
     r'^§§§第\d+章.*$',
     r'^第\d+章.*$',
     r'^第[一二三四五六七八九十百千]+章.*$',
-    r'^Chapter\s+\d+.*$',
-    r'^CHAPTER\s+\d+.*$',
-    r'^Ch\.?\s+\d+.*$',
+    r'^Chapter\s*[-_:]?\s*\d+.*$',
+    r'^CHAPTER\s*[-_:]?\s*\d+.*$',
+    r'^Ch\.?\s*[-_:]?\s*\d+.*$',
     r'^卷\d+.*$',
-    r'^Episode\s+\d+.*$',
-    r'^EPISODE\s+\d+.*$',
-    r'^Ep\.?\s+\d+.*$',
+    r'^Episode\s*[-_:]?\s*\d+.*$',
+    r'^EPISODE\s*[-_:]?\s*\d+.*$',
+    r'^Ep\.?\s*[-_:]?\s*\d+.*$',
+    r'^EP\.?\s*[-_:]?\s*\d+.*$',     # catches EP1, EP 1, EP-1, EP_1, EP.1
+    r'^[Ee][Pp]\s*[-_:]?\s*\d+.*$',  # catches ep1, Ep1, eP1, etc.
+    r'^\d+\s*[-–—:.].*$',              # catches "1 - Golden Blood" / "1. Golden Blood"
 ]
 
 
@@ -191,24 +194,47 @@ def get_sectPr_raw(doc_xml: Path) -> str:
     return ''
 
 
-def file_has_chapter_heading(doc_xml: Path) -> bool:
-    """
-    Returns True if the doc's body text contains ANY of the known chapter
-    heading patterns. Used to decide whether we need to synthesize a heading
-    from the filename.
-    """
+def get_paragraph_text(para_xml_str: str) -> str:
+    """Extract plain text from a raw paragraph XML string."""
     try:
-        tree = etree.parse(str(doc_xml))
+        elem = etree.fromstring(para_xml_str)
     except Exception:
-        return False
+        return ''
     ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
-    # Concatenate every <w:t> run into a single text blob
-    text_nodes = tree.findall('.//w:body//w:t', ns)
-    full_text = "\n".join(t.text for t in text_nodes if t.text)
+    texts = elem.findall('.//w:t', ns)
+    return ''.join(t.text for t in texts if t.text)
+
+
+def looks_like_heading(text: str) -> bool:
+    """True if this paragraph text matches any known chapter/episode pattern."""
+    text = text.strip()
+    if not text:
+        return False
     for pattern in CHAPTER_PATTERNS:
-        if re.search(pattern, full_text, flags=re.MULTILINE | re.IGNORECASE):
+        if re.match(pattern, text, flags=re.IGNORECASE):
             return True
     return False
+
+
+def extract_first_heading(paragraphs: list, max_check: int = 5) -> tuple:
+    """
+    Look at the first `max_check` non-empty paragraphs. If any of them looks
+    like a chapter/episode heading, return (heading_text, paragraphs_without_it).
+    Otherwise return (None, original_paragraphs).
+    """
+    seen_non_empty = 0
+    for i, para_xml in enumerate(paragraphs):
+        text = get_paragraph_text(para_xml).strip()
+        if not text:
+            continue
+        seen_non_empty += 1
+        if looks_like_heading(text):
+            # Remove this paragraph — it'll be rebuilt as an H1
+            remaining = paragraphs[:i] + paragraphs[i + 1:]
+            return text, remaining
+        if seen_non_empty >= max_check:
+            break
+    return None, paragraphs
 
 
 def _xml_escape(s: str) -> str:
@@ -242,9 +268,12 @@ def derive_heading_from_filename(filepath: Path) -> str:
 
 def merge_docx_files(file_list: list, output_path: Path, progress_callback=None):
     """
-    Merge .docx files in the given order. For each file, if it has NO
-    chapter heading inside it, prepend a synthesized Heading 1 derived
-    from its filename (e.g. 'Chapter 42').
+    Merge .docx files in the given order. Each file gets EXACTLY ONE Heading 1:
+      - If one of the first few paragraphs already looks like a chapter heading,
+        we extract that text, remove that paragraph from the body, and rebuild
+        it as an H1 at the top (so there's no duplicate heading).
+      - Otherwise, we synthesize an H1 from the filename (e.g. 'Chapter 42').
+    Returns (from_doc_count, from_filename_count).
     """
     if not file_list:
         raise ValueError("No files to merge.")
@@ -256,7 +285,8 @@ def merge_docx_files(file_list: list, output_path: Path, progress_callback=None)
         base_xml = base_dir / "word" / "document.xml"
 
         all_paragraphs = []
-        synthesized_count = 0
+        from_doc_count      = 0
+        from_filename_count = 0
 
         for i, f in enumerate(file_list):
             if i == 0:
@@ -268,12 +298,17 @@ def merge_docx_files(file_list: list, output_path: Path, progress_callback=None)
 
             paras = get_body_paragraphs_raw(fxml)
 
-            # If no chapter heading in this file's text, synthesize one from filename
-            if not file_has_chapter_heading(fxml):
-                heading_text = derive_heading_from_filename(f)
-                all_paragraphs.append(build_heading_paragraph_xml(heading_text))
-                synthesized_count += 1
+            # Try to find an existing heading in the first few paragraphs
+            heading_text, paras = extract_first_heading(paras)
 
+            if heading_text:
+                from_doc_count += 1
+            else:
+                heading_text = derive_heading_from_filename(f)
+                from_filename_count += 1
+
+            # Prepend EXACTLY ONE H1 for this chapter/episode
+            all_paragraphs.append(build_heading_paragraph_xml(heading_text))
             all_paragraphs.extend(paras)
 
             if progress_callback:
@@ -304,7 +339,7 @@ mc:Ignorable="w14">
             f.write(new_xml)
 
         pack_docx(base_dir, output_path)
-        return synthesized_count
+        return from_doc_count, from_filename_count
 
 
 def format_chapter_headings(xml_path: Path) -> int:
@@ -372,13 +407,14 @@ def format_chapter_headings(xml_path: Path) -> int:
 
 def process_combiner_files(sorted_files: list, output_path: Path, progress_callback=None):
     """
-    Returns (formatted_heading_count, synthesized_from_filename_count)
+    Returns (from_doc_count, from_filename_count) — one H1 per file, guaranteed.
     """
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         merged_path = tmp / "merged.docx"
-        synthesized = merge_docx_files(sorted_files, merged_path, progress_callback)
+        from_doc, from_filename = merge_docx_files(sorted_files, merged_path, progress_callback)
 
+        # Repack (no extra heading formatting needed — headings were built as H1 during merge)
         unpack_dir = tmp / "unpacked"
         unpack_docx(merged_path, unpack_dir)
         doc_xml = unpack_dir / "word" / "document.xml"
@@ -386,9 +422,8 @@ def process_combiner_files(sorted_files: list, output_path: Path, progress_callb
         if not doc_xml.exists():
             raise ValueError("No document.xml found — the .docx files may be corrupted.")
 
-        formatted = format_chapter_headings(doc_xml)
         pack_docx(unpack_dir, output_path)
-        return formatted, synthesized
+        return from_doc, from_filename
 
 
 def render_docx_combiner():
@@ -452,7 +487,7 @@ def render_docx_combiner():
                     progress_bar.progress(pct, text=f"Merging ({current}/{total}): {filename}")
 
                 try:
-                    formatted, synthesized = process_combiner_files(
+                    from_doc, from_filename = process_combiner_files(
                         sorted_files, output_path, update_progress
                     )
                     progress_bar.progress(100, text="Complete!")
@@ -462,8 +497,9 @@ def render_docx_combiner():
 
                     result_area.success(
                         f"✅ Done! Merged **{len(sorted_files)} file(s)** · "
-                        f"**{formatted}** in-doc heading(s) formatted · "
-                        f"**{synthesized}** heading(s) synthesized from filename."
+                        f"**{from_doc}** heading(s) taken from inside the doc · "
+                        f"**{from_filename}** heading(s) built from filename. "
+                        f"Exactly one H1 per chapter."
                     )
                     st.download_button(
                         label=f"⬇️ Download {output_filename}",
