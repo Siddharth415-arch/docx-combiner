@@ -48,7 +48,32 @@ st.set_page_config(
     page_title="Tools",
     page_icon="🛠️",
     layout="centered",
+    menu_items={}  # removes the hamburger "About / Report a bug" menu
 )
+
+
+# ── Hide Streamlit Community Cloud chrome (fork button, creator profile, footer) ──
+HIDE_STREAMLIT_STYLE = """
+<style>
+    /* Hide the hamburger menu */
+    #MainMenu {visibility: hidden !important;}
+    /* Hide "Made with Streamlit" footer */
+    footer {visibility: hidden !important;}
+    /* Hide the "Fork" button overlay on Community Cloud */
+    .viewerBadge_container__1QSob {display: none !important;}
+    .viewerBadge_link__qRIco    {display: none !important;}
+    ._container_gzau3_1         {display: none !important;}
+    ._link_gzau3_10             {display: none !important;}
+    ._viewerBadge_nim44_23      {display: none !important;}
+    div[data-testid="stDecoration"] {display: none !important;}
+    div[data-testid="stToolbar"]    {display: none !important;}
+    /* Hide the GitHub-corner fork ribbon if it appears */
+    .stAppDeployButton {display: none !important;}
+    .stAppHeader       {display: none !important;}
+    header[data-testid="stHeader"] {display: none !important;}
+</style>
+"""
+st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -76,10 +101,14 @@ CHAPTER_PATTERNS = [
     r'^CHAPTER\s+\d+.*$',
     r'^Ch\.?\s+\d+.*$',
     r'^卷\d+.*$',
+    r'^Episode\s+\d+.*$',
+    r'^EPISODE\s+\d+.*$',
+    r'^Ep\.?\s+\d+.*$',
 ]
 
 
 def extract_start_number(filepath: Path) -> int:
+    """Pull the episode/chapter number out of the filename stem."""
     name = filepath.stem
     numbers = re.findall(r'\d+', name)
     if not numbers:
@@ -144,12 +173,63 @@ def get_sectPr_raw(doc_xml: Path) -> str:
     return ''
 
 
+def file_has_chapter_heading(doc_xml: Path) -> bool:
+    """
+    Returns True if the doc's body text contains ANY of the known chapter
+    heading patterns. Used to decide whether we need to synthesize a heading
+    from the filename.
+    """
+    try:
+        tree = etree.parse(str(doc_xml))
+    except Exception:
+        return False
+    ns = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+    # Concatenate every <w:t> run into a single text blob
+    text_nodes = tree.findall('.//w:body//w:t', ns)
+    full_text = "\n".join(t.text for t in text_nodes if t.text)
+    for pattern in CHAPTER_PATTERNS:
+        if re.search(pattern, full_text, flags=re.MULTILINE | re.IGNORECASE):
+            return True
+    return False
+
+
+def _xml_escape(s: str) -> str:
+    return (s.replace('&', '&amp;')
+             .replace('<', '&lt;')
+             .replace('>', '&gt;'))
+
+
+def build_heading_paragraph_xml(heading_text: str) -> str:
+    """Return raw Heading-1 paragraph XML for the heading text."""
+    safe = _xml_escape(heading_text)
+    return (
+        '<w:p>'
+        '<w:pPr><w:pStyle w:val="Heading1"/></w:pPr>'
+        f'<w:r><w:t xml:space="preserve">{safe}</w:t></w:r>'
+        '</w:p>'
+    )
+
+
+def derive_heading_from_filename(filepath: Path) -> str:
+    """
+    Build a chapter/episode heading string from the filename.
+    - If the filename contains a number, returns 'Chapter N'.
+    - Otherwise uses the filename stem as-is.
+    """
+    num = extract_start_number(filepath)
+    if num > 0:
+        return f"Chapter {num}"
+    return filepath.stem.strip() or "Chapter"
+
+
 def merge_docx_files(file_list: list, output_path: Path, progress_callback=None):
-    if len(file_list) == 1:
-        shutil.copy(file_list[0], output_path)
-        if progress_callback:
-            progress_callback(1, 1, file_list[0].name)
-        return
+    """
+    Merge .docx files in the given order. For each file, if it has NO
+    chapter heading inside it, prepend a synthesized Heading 1 derived
+    from its filename (e.g. 'Chapter 42').
+    """
+    if not file_list:
+        raise ValueError("No files to merge.")
 
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
@@ -158,18 +238,30 @@ def merge_docx_files(file_list: list, output_path: Path, progress_callback=None)
         base_xml = base_dir / "word" / "document.xml"
 
         all_paragraphs = []
+        synthesized_count = 0
+
         for i, f in enumerate(file_list):
             if i == 0:
-                paras = get_body_paragraphs_raw(base_xml)
+                fxml = base_xml
             else:
                 fdir = tmp / f"doc_{i}"
                 unpack_docx(f, fdir)
                 fxml = fdir / "word" / "document.xml"
-                paras = get_body_paragraphs_raw(fxml)
+
+            paras = get_body_paragraphs_raw(fxml)
+
+            # If no chapter heading in this file's text, synthesize one from filename
+            if not file_has_chapter_heading(fxml):
+                heading_text = derive_heading_from_filename(f)
+                all_paragraphs.append(build_heading_paragraph_xml(heading_text))
+                synthesized_count += 1
+
             all_paragraphs.extend(paras)
+
             if progress_callback:
                 progress_callback(i + 1, len(file_list), f.name)
 
+        # Preserve section properties from the last file
         last_dir = tmp / "last"
         unpack_docx(file_list[-1], last_dir)
         sect_pr = get_sectPr_raw(last_dir / "word" / "document.xml")
@@ -194,6 +286,7 @@ mc:Ignorable="w14">
             f.write(new_xml)
 
         pack_docx(base_dir, output_path)
+        return synthesized_count
 
 
 def format_chapter_headings(xml_path: Path) -> int:
@@ -259,11 +352,14 @@ def format_chapter_headings(xml_path: Path) -> int:
     return chapter_count
 
 
-def process_combiner_files(sorted_files: list, output_path: Path, progress_callback=None) -> int:
+def process_combiner_files(sorted_files: list, output_path: Path, progress_callback=None):
+    """
+    Returns (formatted_heading_count, synthesized_from_filename_count)
+    """
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         merged_path = tmp / "merged.docx"
-        merge_docx_files(sorted_files, merged_path, progress_callback)
+        synthesized = merge_docx_files(sorted_files, merged_path, progress_callback)
 
         unpack_dir = tmp / "unpacked"
         unpack_docx(merged_path, unpack_dir)
@@ -272,9 +368,9 @@ def process_combiner_files(sorted_files: list, output_path: Path, progress_callb
         if not doc_xml.exists():
             raise ValueError("No document.xml found — the .docx files may be corrupted.")
 
-        count = format_chapter_headings(doc_xml)
+        formatted = format_chapter_headings(doc_xml)
         pack_docx(unpack_dir, output_path)
-        return count
+        return formatted, synthesized
 
 
 def render_docx_combiner():
@@ -282,7 +378,9 @@ def render_docx_combiner():
     st.markdown(
         "Upload multiple `.docx` files and this tool will automatically **sort them "
         "by episode/chapter number**, **merge them in the correct order**, and "
-        "**format chapter headings** as Heading 1 — ready to download in seconds."
+        "**format chapter headings** as Heading 1. "
+        "If a file has no chapter heading inside it, a heading is created "
+        "**from the filename** (e.g. `Show_42.docx` → `Chapter 42`)."
     )
     st.divider()
 
@@ -336,7 +434,9 @@ def render_docx_combiner():
                     progress_bar.progress(pct, text=f"Merging ({current}/{total}): {filename}")
 
                 try:
-                    count = process_combiner_files(sorted_files, output_path, update_progress)
+                    formatted, synthesized = process_combiner_files(
+                        sorted_files, output_path, update_progress
+                    )
                     progress_bar.progress(100, text="Complete!")
 
                     with open(output_path, "rb") as f:
@@ -344,7 +444,8 @@ def render_docx_combiner():
 
                     result_area.success(
                         f"✅ Done! Merged **{len(sorted_files)} file(s)** · "
-                        f"**{count}** chapter heading(s) formatted as Heading 1."
+                        f"**{formatted}** in-doc heading(s) formatted · "
+                        f"**{synthesized}** heading(s) synthesized from filename."
                     )
                     st.download_button(
                         label=f"⬇️ Download {output_filename}",
@@ -367,7 +468,9 @@ def render_docx_combiner():
     st.caption(
         "Supported chapter heading formats: &nbsp;"
         "`第X章` &nbsp;·&nbsp; `Chapter X` &nbsp;·&nbsp; `CHAPTER X` &nbsp;·&nbsp; "
-        "`Ch. X` &nbsp;·&nbsp; `卷X` &nbsp;·&nbsp; Chinese numeral chapters"
+        "`Ch. X` &nbsp;·&nbsp; `Episode X` &nbsp;·&nbsp; `卷X` &nbsp;·&nbsp; "
+        "Chinese numeral chapters. &nbsp; If none are found inside a file, "
+        "a heading is built from the filename (e.g. `Show_42.docx` → `Chapter 42`)."
     )
 
 
@@ -799,7 +902,6 @@ def _translate_docx_gemini(file_bytes: bytes, src: str, tgt: str,
     total   = len(batches)
 
     def run_batch(start, batch):
-        # Acquire semaphore to cap global concurrent Gemini calls
         ctx = semaphore if semaphore else threading.Semaphore(GEMINI_MAX_CONCURRENT)
         with ctx:
             result = _gemini_translate_batch(batch, src, tgt, model)
@@ -810,11 +912,10 @@ def _translate_docx_gemini(file_bytes: bytes, src: str, tgt: str,
             if progress_cb:
                 progress_cb(completed[0], total)
 
-    # All batches for this file fire in parallel (rate-limited by semaphore)
     with ThreadPoolExecutor(max_workers=GEMINI_MAX_CONCURRENT) as ex:
         futs = [ex.submit(run_batch, s, b) for s, b in batches]
         for f in as_completed(futs):
-            f.result()   # re-raise any unexpected errors
+            f.result()
 
     dst_doc = Document()
     for i, para in enumerate(src_doc.paragraphs):
@@ -835,7 +936,6 @@ def _fetch_files_from_drive(folder_url: str) -> dict:
     """
     Download all .docx files from a public Google Drive folder.
     Returns {filename: bytes}.
-    Folder must be shared as 'Anyone with the link can view'.
     """
     if not GDOWN_AVAILABLE:
         raise RuntimeError("gdown is not installed. Cannot fetch from Drive.")
@@ -867,12 +967,10 @@ def render_document_translator():
     )
     st.divider()
 
-    # ── Session state init ────────────────────────────────────────────────────
     for key, default in [("tr_results", {}), ("tr_errors", {}), ("tr_api_key", "")]:
         if key not in st.session_state:
             st.session_state[key] = default
 
-    # ── ① Engine selector ────────────────────────────────────────────────────
     engine = st.radio(
         "Translation engine",
         options=["🆓  Free — Google Translate (no key needed)",
@@ -882,7 +980,6 @@ def render_document_translator():
     )
     use_gemini = engine.startswith("✨")
 
-    # ── ② Gemini API key box (only when Gemini is selected) ──────────────────
     model_name = GEMINI_MODELS[0]
 
     if use_gemini:
@@ -933,7 +1030,6 @@ def render_document_translator():
 
     st.divider()
 
-    # ── ③ Language selectors ──────────────────────────────────────────────────
     col1, col2, col3 = st.columns([2, 0.6, 2])
     with col1:
         src_name = st.selectbox("Source language", list(LANGUAGES.keys()),
@@ -950,7 +1046,6 @@ def render_document_translator():
 
     st.divider()
 
-    # ── ④ Input — two tabs ────────────────────────────────────────────────────
     tab_upload, tab_drive = st.tabs(["📁  Upload Files from Computer",
                                      "🔗  Google Drive Folder Link"])
 
@@ -977,7 +1072,6 @@ def render_document_translator():
 
     st.divider()
 
-    # ── ⑤ Readiness check & translate button ─────────────────────────────────
     has_input = bool(uploaded_files) or bool(drive_link)
     has_key   = bool(st.session_state.tr_api_key) if use_gemini else True
     ready     = has_input and has_key
@@ -987,7 +1081,6 @@ def render_document_translator():
     elif not has_input:
         st.info("⬆️ Upload files or paste a Drive folder link to get started.")
 
-    # ── Quick API key test ────────────────────────────────────────────────────
     if use_gemini and has_key:
         if st.button("🔬 Test API Key", key="tr_test"):
             with st.spinner("Testing Gemini API key…"):
@@ -1009,7 +1102,6 @@ def render_document_translator():
         st.session_state.tr_results = {}
         st.session_state.tr_errors  = {}
 
-        # Set up Gemini model + shared rate-limit semaphore
         gemini_model     = None
         gemini_semaphore = None
         if use_gemini:
@@ -1017,7 +1109,6 @@ def render_document_translator():
             gemini_model     = genai.GenerativeModel(model_name)
             gemini_semaphore = threading.Semaphore(GEMINI_MAX_CONCURRENT)
 
-        # Collect file bytes from upload and/or Drive
         file_bytes = {}
         if uploaded_files:
             for f in uploaded_files:
@@ -1042,7 +1133,6 @@ def render_document_translator():
         st.info(f"Translating **{len(file_bytes)} file(s)** — "
                 f"{src_lang} → {tgt_lang} · {engine_label}")
 
-        # Shared state — workers write only plain dicts, never st.*
         progress_state = {
             name: {"done": 0, "total": 1, "status": "queued"}
             for name in file_bytes
@@ -1051,7 +1141,6 @@ def render_document_translator():
         errors     = {}
         outer_lock = threading.Lock()
 
-        # Build per-file UI rows in main thread
         ui = {}
         for name in file_bytes:
             st.markdown(f"**{name}**")
@@ -1059,7 +1148,6 @@ def render_document_translator():
             ui[name]["status"].text("⌛ Queued…")
         st.divider()
 
-        # Worker — pure computation, zero st.* calls inside
         def file_worker(name, content):
             progress_state[name]["status"] = "running"
 
@@ -1084,7 +1172,6 @@ def render_document_translator():
                     errors[name] = str(e)
                 progress_state[name]["status"] = "error"
 
-        # Run workers + poll UI from main thread
         with ThreadPoolExecutor(max_workers=TRANS_FILE_WORKERS) as executor:
             futures = {
                 executor.submit(file_worker, n, c): n
@@ -1111,7 +1198,6 @@ def render_document_translator():
                         ui[name]["status"].text(f"❌ {errors.get(name, 'unknown error')}")
                 time.sleep(0.3)
 
-        # Final pass
         for name, state in progress_state.items():
             if state["status"] == "done":
                 ui[name]["bar"].progress(1.0)
@@ -1122,10 +1208,8 @@ def render_document_translator():
         st.session_state.tr_results = results
         st.session_state.tr_errors  = errors
 
-        # Force a clean re-render so the download section appears immediately
         st.rerun()
 
-    # ── ⑥ Download — persists across re-runs via session_state ───────────────
     if st.session_state.get("tr_results"):
         results = st.session_state.tr_results
         errors  = st.session_state.tr_errors
