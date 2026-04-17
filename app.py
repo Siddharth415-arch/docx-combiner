@@ -52,25 +52,43 @@ st.set_page_config(
 )
 
 
-# ── Hide Streamlit Community Cloud chrome (fork button, creator profile, footer) ──
+# ── Hide Streamlit Community Cloud chrome ──
+# Specifically targets the "Created by <username>" profile badge and its avatar
+# so the app doesn't expose the owner's identity to viewers.
 HIDE_STREAMLIT_STYLE = """
 <style>
-    /* Hide the hamburger menu */
+    /* Hamburger menu, footer, header */
     #MainMenu {visibility: hidden !important;}
-    /* Hide "Made with Streamlit" footer */
-    footer {visibility: hidden !important;}
-    /* Hide the "Fork" button overlay on Community Cloud */
-    .viewerBadge_container__1QSob {display: none !important;}
-    .viewerBadge_link__qRIco    {display: none !important;}
-    ._container_gzau3_1         {display: none !important;}
-    ._link_gzau3_10             {display: none !important;}
-    ._viewerBadge_nim44_23      {display: none !important;}
+    footer   {visibility: hidden !important;}
+    header[data-testid="stHeader"]  {display: none !important;}
     div[data-testid="stDecoration"] {display: none !important;}
     div[data-testid="stToolbar"]    {display: none !important;}
-    /* Hide the GitHub-corner fork ribbon if it appears */
-    .stAppDeployButton {display: none !important;}
-    .stAppHeader       {display: none !important;}
-    header[data-testid="stHeader"] {display: none !important;}
+    .stAppDeployButton              {display: none !important;}
+    .stAppHeader                    {display: none !important;}
+
+    /* ── "Created by siddharth415-arch" — profile badge (avatar + username) ── */
+    /* Catch every hashed/variable class name used by Streamlit Cloud */
+    [class*="profileContainer"]     {display: none !important;}
+    [class*="profile_container"]    {display: none !important;}
+    [class*="_profileContainer"]    {display: none !important;}
+    [class*="_profile_"]            {display: none !important;}
+    [class*="stProfileBadge"]       {display: none !important;}
+    [class*="ProfileBadge"]         {display: none !important;}
+    [data-testid*="stProfile"]      {display: none !important;}
+    [data-testid*="profileBadge"]   {display: none !important;}
+
+    /* The <a> tag that wraps the avatar + username and points to the user's profile */
+    a[href*="share.streamlit.io/user/"] {display: none !important;}
+    a[href*="/user/siddharth"]          {display: none !important;}
+
+    /* Nuclear option — hide any fixed-position element anchored bottom-right
+       that contains a link to a Streamlit user profile */
+    div:has(> a[href*="share.streamlit.io/user/"]) {display: none !important;}
+
+    /* Also hide Fork / viewer badges in case they're still showing */
+    [class*="viewerBadge"]              {display: none !important;}
+    [data-testid*="viewerBadge"]        {display: none !important;}
+    iframe[title*="viewerBadge"]        {display: none !important;}
 </style>
 """
 st.markdown(HIDE_STREAMLIT_STYLE, unsafe_allow_html=True)
