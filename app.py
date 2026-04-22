@@ -561,69 +561,149 @@ def set_document_background_pagination(doc):
         pass
 
 
+# ── Benchmark-Converter helpers ──────────────────────────────────────────────
+# Strict episode/chapter regexes. A narrative sentence like "1. She walked in."
+# will NOT match these because we require the Episode/Chapter/Ep/Ch keyword,
+# or (in the style-based check below) an exact "Heading 1" style + bare number.
+_EPISODE_REGEXES = [
+    re.compile(r'^\s*(?:Episode|Chapter)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
+    re.compile(r'^\s*(?:Ep|Ch)\.?\s*[-_:.]?\s*(\d+)\b',        re.IGNORECASE),
+    re.compile(r'^\s*EP\s*[-_:.]?\s*(\d+)\b',                  re.IGNORECASE),
+]
+
+# Strips metadata like "WORD COUNT: 1512", "WORD COUNT - 1361", "Word count: 1350".
+# Also catches the concatenated garbage case "THE WRONG ANAWORD COUNT - 1361".
+_WORDCOUNT_STRIP = re.compile(r'\s*WORD\s*COUNT\s*[:\-–]?\s*\d+\s*$', re.IGNORECASE)
+
+
+def _is_chapter_heading(text: str, style_name: str):
+    """
+    Decide if a paragraph is a chapter heading — returns (is_heading, ep_num).
+
+    A paragraph counts as a chapter heading ONLY when either
+      (a) its text matches a strict Episode/Chapter/Ep/Ch regex, OR
+      (b) its style is EXACTLY 'Heading 1' AND its text looks like a
+          chapter line (bare number, or number + separator + title).
+
+    Heading 2 / Heading 3 / subtitle paragraphs in the source are NOT
+    promoted — per Taggen's rule: "Only the chapter name or number
+    should be formatted as a heading. No other content should be in a
+    heading style."
+    """
+    if not text:
+        return False, None
+
+    for rx in _EPISODE_REGEXES:
+        m = rx.match(text)
+        if m:
+            return True, int(m.group(1))
+
+    if style_name == 'Heading 1':
+        # "1 - Title" / "1: Title" / "1. Title"
+        m = re.match(r'^\s*(\d+)\s*[-–—:.\s]', text)
+        if m:
+            return True, int(m.group(1))
+        # bare number
+        m = re.match(r'^\s*(\d+)\s*$', text)
+        if m:
+            return True, int(m.group(1))
+        # Chinese markers
+        if re.match(r'^\s*(?:第[\d一二三四五六七八九十百千]+[章卷])', text):
+            return True, None
+
+    return False, None
+
+
+def _clean_heading_text(text: str, episode_num, fallback_num: int) -> str:
+    """
+    Normalise a chapter heading line for the benchmark output.
+
+    - Strips trailing 'WORD COUNT …' junk.
+    - Collapses internal whitespace.
+    - Rewrites 'EPISODE 6 : THE PEONY RECORD' → 'Episode 6: The Peony Record'
+      (single H1, no split).
+    - Falls back to 'Episode N' if the source is just a bare number.
+    """
+    cleaned = _WORDCOUNT_STRIP.sub('', text).strip()
+    cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+
+    num = episode_num if episode_num is not None else fallback_num
+
+    m = re.match(
+        r'^\s*(?:Episode|Chapter|Ep\.?|Ch\.?|EP)\s*[-_:.]?\s*\d+\s*'
+        r'[-–—:.\s]*\s*(.*?)\s*$',
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        subtitle = m.group(1).strip(' -–—:.')
+        return f"Episode {num}: {subtitle}" if subtitle else f"Episode {num}"
+
+    if cleaned and not cleaned[0].isdigit():
+        return f"Episode {num}: {cleaned}"
+    return f"Episode {num}"
+
+
 def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[bytes, str]:
+    """
+    Convert a .docx into the Taggen benchmark format.
+
+    Per the Taggen guide:
+      • Every chapter name/number must START with a Heading style.
+      • ONLY the chapter name/number should be a heading — nothing else.
+      • Filename: <show_name>_<first_ch>-<last_ch>.docx
+
+    Therefore this writes EXACTLY ONE Heading 1 per detected chapter and
+    demotes everything else (including source Heading 2 subtitles,
+    'Word Count: 1671' lines, body text) to Normal paragraphs.
+    """
     show_name, first_ep, last_ep = extract_show_info_from_filename(filename)
-    doc = Document(io.BytesIO(file_bytes))
+
+    doc     = Document(io.BytesIO(file_bytes))
     new_doc = Document()
     set_document_background_pagination(new_doc)
+
     for section in new_doc.sections:
         section.top_margin    = Inches(1)
         section.bottom_margin = Inches(1)
         section.left_margin   = Inches(1)
         section.right_margin  = Inches(1)
+
     styles = new_doc.styles
     try:
         styles['Heading 1']
     except KeyError:
         styles.add_style('Heading 1', WD_STYLE_TYPE.PARAGRAPH)
 
-    episode_patterns = [
-        re.compile(r'^Episode\s+(\d+)', re.IGNORECASE),
-        re.compile(r'^Chapter\s+(\d+)',  re.IGNORECASE),
-        re.compile(r'^Ep\.?\s+(\d+)',    re.IGNORECASE),
-        re.compile(r'^Ch\.?\s+(\d+)',    re.IGNORECASE),
-        re.compile(r'^(\d+)\.'),
-        re.compile(r'^Episode\s+(\d+):', re.IGNORECASE),
-        re.compile(r'^Chapter\s+(\d+):', re.IGNORECASE),
-    ]
-    title_pattern = re.compile(r':\s*(.+)$')
-    current_episode  = first_ep
+    current_episode   = first_ep
     paragraphs_to_add = []
+    seen_any_heading  = False
 
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
             continue
-        is_heading  = False
-        episode_num = None
-        for pattern in episode_patterns:
-            m = pattern.match(text)
-            if m:
-                episode_num = int(m.group(1))
-                is_heading  = True
-                break
-        if not is_heading and para.style.name.startswith('Heading'):
-            is_heading = True
-            num_m = re.search(r'\d+', text)
-            if num_m:
-                episode_num = int(num_m.group())
+
+        style_name         = para.style.name if para.style else ''
+        is_heading, ep_num = _is_chapter_heading(text, style_name)
+
         if is_heading:
-            heading_text = f"Episode {episode_num}" if episode_num else f"Episode {current_episode}"
-            current_episode = (episode_num or current_episode) + 1
+            heading_text    = _clean_heading_text(text, ep_num, current_episode)
+            current_episode = (ep_num if ep_num is not None else current_episode) + 1
             paragraphs_to_add.append(('heading1', heading_text))
-            title_m = title_pattern.search(text)
-            if title_m:
-                paragraphs_to_add.append(('heading2', title_m.group(1).strip()))
+            seen_any_heading = True
         else:
+            # EVERYTHING else → Normal (source Heading 2, Word Count lines, body).
             paragraphs_to_add.append(('normal', text))
+
+    # Safety net: Taggen requires the file to start with a heading.
+    if not seen_any_heading:
+        paragraphs_to_add.insert(0, ('heading1', f"Episode {first_ep}"))
 
     for para_type, para_text in paragraphs_to_add:
         if para_type == 'heading1':
             p = new_doc.add_paragraph(para_text)
-            p.style = 'Heading 1'
-        elif para_type == 'heading2':
-            p = new_doc.add_paragraph(para_text)
-            p.style = 'Heading 2'
+            p.style = new_doc.styles['Heading 1']
         else:
             new_doc.add_paragraph(para_text)
 
