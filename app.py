@@ -566,13 +566,28 @@ def set_document_background_pagination(doc):
 # will NOT match these because we require the Episode/Chapter/Ep/Ch keyword,
 # or (in the style-based check below) an exact "Heading 1" style + bare number.
 #
-# NOTE: `#*\s*` at the start lets us also match markdown-style chapter lines
-# like `## Chapter 1 A Game, A Dream` — source files converted from .md or
-# scraped from the web often carry these literal # prefixes.
+# The leading `_DECOR` character class swallows ANY combination of the most
+# common decorator symbols writers / markdown-to-docx converters prepend to
+# chapter lines (#, *, =, -, ~, _, whitespace). This lets us match e.g.
+#   `## Chapter 1 A Game, A Dream`
+#   `*** Chapter 1 ***`
+#   `=== Chapter 1 ===`
+#   `**Chapter 1**`
+#   `---Chapter 1---`
+# without any special-case code per decorator style.
+_DECOR = r'[\s#*=\-~_]*'
+
 _EPISODE_REGEXES = [
-    re.compile(r'^\s*#*\s*(?:Episode|Chapter)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
-    re.compile(r'^\s*#*\s*(?:Ep|Ch)\.?\s*[-_:.]?\s*(\d+)\b',        re.IGNORECASE),
-    re.compile(r'^\s*#*\s*EP\s*[-_:.]?\s*(\d+)\b',                  re.IGNORECASE),
+    # English: Episode/Chapter + number
+    re.compile(rf'^{_DECOR}(?:Episode|Chapter)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
+    # English short forms: Ep / Ch (with optional dot)
+    re.compile(rf'^{_DECOR}(?:Ep|Ch)\.?\s*[-_:.]?\s*(\d+)\b',        re.IGNORECASE),
+    # Caps-only "EP 5" / "EP-5"
+    re.compile(rf'^{_DECOR}EP\s*[-_:.]?\s*(\d+)\b',                  re.IGNORECASE),
+    # Chinese: 第1章 / 第一章 / 第100章 (also 第N卷 volume markers)
+    re.compile(rf'^{_DECOR}第\s*([\d一二三四五六七八九十百千]+)\s*[章卷]', re.IGNORECASE),
+    # Part / Section / Volume with number — used by some scraped sources
+    re.compile(rf'^{_DECOR}(?:Part|Section|Volume)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
 ]
 
 # Strips metadata like "WORD COUNT: 1512", "WORD COUNT - 1361", "Word count: 1350".
@@ -600,7 +615,14 @@ def _is_chapter_heading(text: str, style_name: str):
     for rx in _EPISODE_REGEXES:
         m = rx.match(text)
         if m:
-            return True, int(m.group(1))
+            # Some patterns (e.g. Chinese numeral chapters `第一百章`) capture
+            # a non-ASCII number we can't int()-parse. Still treat the line
+            # as a heading, but return num=None so the outer loop falls back
+            # to the running `current_episode` counter.
+            try:
+                return True, int(m.group(1))
+            except (ValueError, IndexError):
+                return True, None
 
     if style_name == 'Heading 1':
         # "1 - Title" / "1: Title" / "1. Title"
@@ -629,8 +651,11 @@ def _clean_heading_text(text: str, episode_num, fallback_num: int) -> str:
     - Falls back to 'Episode N' if the source is just a bare number.
     """
     cleaned = _WORDCOUNT_STRIP.sub('', text).strip()
-    # Strip leading markdown prefix (e.g. "## Chapter 1 ..." → "Chapter 1 ...")
-    cleaned = re.sub(r'^#+\s*', '', cleaned)
+    # Strip BOTH leading and trailing decorator chars (markdown, asterisks,
+    # equals, dashes, tildes, underscores) so `*** Chapter 1 ***`,
+    # `**Chapter 1**`, `=== Chapter 1 ===`, etc. all normalise cleanly.
+    cleaned = re.sub(r'^[#*=\-~_\s]+', '', cleaned)
+    cleaned = re.sub(r'[#*=\-~_\s]+$', '', cleaned)
     cleaned = re.sub(r'\s{2,}', ' ', cleaned)
 
     num = episode_num if episode_num is not None else fallback_num
@@ -693,15 +718,30 @@ def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[
 
     # ── PASS 2 — DEDUPE duplicate chapter headings.
     # Some source files repeat the same episode heading on multiple lines
-    # (e.g. a TOC-style line + the real heading right before the content).
-    # Per the spec: only the occurrence that DIRECTLY PRECEDES the episode
-    # content should become H1. Concretely: for any chapter number that
-    # appears more than once as a detected heading, keep only the LAST
-    # occurrence as a heading — earlier duplicates are demoted to Normal.
-    last_heading_idx_for_num = {}
+    # (e.g. a TOC-style line at the top + the real heading right before the
+    # content; or a stray reprint at the end of a chapter). Per the spec
+    # only the occurrence that DIRECTLY PRECEDES the episode content should
+    # become H1.
+    #
+    # Heuristic: for each repeated chapter number, the "real" heading is the
+    # one followed by the MOST body-paragraph content before the next
+    # detected heading of any chapter. A TOC line is usually followed by
+    # another heading (the next TOC entry) with 0 paragraphs in between;
+    # the real heading is followed by many body paragraphs. Ties fall back
+    # to the later occurrence.
+    heading_positions = [i for i, (_t, h, _n) in enumerate(raw) if h]
+    content_following = {}
+    for k, idx in enumerate(heading_positions):
+        nxt = heading_positions[k + 1] if k + 1 < len(heading_positions) else len(raw)
+        content_following[idx] = nxt - idx - 1
+
+    winning_idx_for_num = {}
     for idx, (_t, is_heading, ep_num) in enumerate(raw):
         if is_heading and ep_num is not None:
-            last_heading_idx_for_num[ep_num] = idx
+            prev = winning_idx_for_num.get(ep_num)
+            if (prev is None
+                    or content_following[idx] >= content_following[prev]):
+                winning_idx_for_num[ep_num] = idx
 
     current_episode   = first_ep
     paragraphs_to_add = []
@@ -709,10 +749,11 @@ def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[
 
     for idx, (text, is_heading, ep_num) in enumerate(raw):
         if is_heading:
-            # If this chapter number has a later heading occurrence, this
-            # one is a duplicate (e.g. TOC row) — demote it to Normal.
+            # If this chapter number has a "better" heading occurrence
+            # elsewhere (one with more content following it), demote this
+            # one to Normal — it's a TOC row or stray duplicate.
             if (ep_num is not None
-                    and last_heading_idx_for_num.get(ep_num) != idx):
+                    and winning_idx_for_num.get(ep_num) != idx):
                 paragraphs_to_add.append(('normal', text))
                 continue
 
