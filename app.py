@@ -565,10 +565,14 @@ def set_document_background_pagination(doc):
 # Strict episode/chapter regexes. A narrative sentence like "1. She walked in."
 # will NOT match these because we require the Episode/Chapter/Ep/Ch keyword,
 # or (in the style-based check below) an exact "Heading 1" style + bare number.
+#
+# NOTE: `#*\s*` at the start lets us also match markdown-style chapter lines
+# like `## Chapter 1 A Game, A Dream` — source files converted from .md or
+# scraped from the web often carry these literal # prefixes.
 _EPISODE_REGEXES = [
-    re.compile(r'^\s*(?:Episode|Chapter)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
-    re.compile(r'^\s*(?:Ep|Ch)\.?\s*[-_:.]?\s*(\d+)\b',        re.IGNORECASE),
-    re.compile(r'^\s*EP\s*[-_:.]?\s*(\d+)\b',                  re.IGNORECASE),
+    re.compile(r'^\s*#*\s*(?:Episode|Chapter)\s*[-_:.]?\s*(\d+)\b', re.IGNORECASE),
+    re.compile(r'^\s*#*\s*(?:Ep|Ch)\.?\s*[-_:.]?\s*(\d+)\b',        re.IGNORECASE),
+    re.compile(r'^\s*#*\s*EP\s*[-_:.]?\s*(\d+)\b',                  re.IGNORECASE),
 ]
 
 # Strips metadata like "WORD COUNT: 1512", "WORD COUNT - 1361", "Word count: 1350".
@@ -625,6 +629,8 @@ def _clean_heading_text(text: str, episode_num, fallback_num: int) -> str:
     - Falls back to 'Episode N' if the source is just a bare number.
     """
     cleaned = _WORDCOUNT_STRIP.sub('', text).strip()
+    # Strip leading markdown prefix (e.g. "## Chapter 1 ..." → "Chapter 1 ...")
+    cleaned = re.sub(r'^#+\s*', '', cleaned)
     cleaned = re.sub(r'\s{2,}', ' ', cleaned)
 
     num = episode_num if episode_num is not None else fallback_num
@@ -675,19 +681,41 @@ def convert_single_file_to_benchmark(file_bytes: bytes, filename: str) -> tuple[
     except KeyError:
         styles.add_style('Heading 1', WD_STYLE_TYPE.PARAGRAPH)
 
-    current_episode   = first_ep
-    paragraphs_to_add = []
-    seen_any_heading  = False
-
+    # ── PASS 1 — collect every non-empty paragraph with a heading flag ──
+    raw = []   # list of (text, is_heading, ep_num)
     for para in doc.paragraphs:
         text = para.text.strip()
         if not text:
             continue
-
         style_name         = para.style.name if para.style else ''
         is_heading, ep_num = _is_chapter_heading(text, style_name)
+        raw.append((text, is_heading, ep_num))
 
+    # ── PASS 2 — DEDUPE duplicate chapter headings.
+    # Some source files repeat the same episode heading on multiple lines
+    # (e.g. a TOC-style line + the real heading right before the content).
+    # Per the spec: only the occurrence that DIRECTLY PRECEDES the episode
+    # content should become H1. Concretely: for any chapter number that
+    # appears more than once as a detected heading, keep only the LAST
+    # occurrence as a heading — earlier duplicates are demoted to Normal.
+    last_heading_idx_for_num = {}
+    for idx, (_t, is_heading, ep_num) in enumerate(raw):
+        if is_heading and ep_num is not None:
+            last_heading_idx_for_num[ep_num] = idx
+
+    current_episode   = first_ep
+    paragraphs_to_add = []
+    seen_any_heading  = False
+
+    for idx, (text, is_heading, ep_num) in enumerate(raw):
         if is_heading:
+            # If this chapter number has a later heading occurrence, this
+            # one is a duplicate (e.g. TOC row) — demote it to Normal.
+            if (ep_num is not None
+                    and last_heading_idx_for_num.get(ep_num) != idx):
+                paragraphs_to_add.append(('normal', text))
+                continue
+
             heading_text    = _clean_heading_text(text, ep_num, current_episode)
             current_episode = (ep_num if ep_num is not None else current_episode) + 1
             paragraphs_to_add.append(('heading1', heading_text))
